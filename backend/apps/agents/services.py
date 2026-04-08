@@ -80,6 +80,8 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
         "clarification_question": clarification_question,
         "search_domains": search_domains,
         "result_listing_codes": result_listing_codes,
+        "results_by_domain": results_by_domain,
+        "active_filters": thread_filter.active_filters,
     }
     assistant_message = _append_message(
         thread,

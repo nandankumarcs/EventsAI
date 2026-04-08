@@ -1,150 +1,300 @@
-import { Bot, DatabaseZap, SendHorizontal, UserRound } from 'lucide-react'
+import {
+  Bot,
+  CalendarDays,
+  CircleDashed,
+  MapPin,
+  SendHorizontal,
+  Sparkles,
+  TicketCheck,
+  UserRound,
+} from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
-import type { HealthResponse } from '@/lib/api'
+import type { HealthResponse, SearchResultItem, ThreadDetail, ThreadMessage } from '@/lib/api'
 
 type ChatWorkspaceProps = {
+  thread: ThreadDetail | null
   draft: string
-  onDraftChange: (value: string) => void
+  sending: boolean
+  bookingListingCode: string | null
+  loadingThread: boolean
   health: HealthResponse | null
   healthError: string | null
+  actionError: string | null
+  onDraftChange: (value: string) => void
+  onSend: () => void
+  onBook: (listingCode: string) => void
 }
 
-const sampleMessages = [
-  {
-    role: 'assistant',
-    content:
-      'Tell me what you want to watch or attend, and I will keep refining the results as your filters evolve.',
-  },
-  {
-    role: 'user',
-    content: 'I want to watch a cricket match this Sunday in Delhi around 7 PM.',
-  },
-  {
-    role: 'assistant',
-    content:
-      'Nice. In later phases I will resolve event type, date, location, and time into deterministic filters before fetching exact results from PostgreSQL.',
-  },
-]
-
 export function ChatWorkspace({
+  thread,
   draft,
-  onDraftChange,
+  sending,
+  bookingListingCode,
+  loadingThread,
   health,
   healthError,
+  actionError,
+  onDraftChange,
+  onSend,
+  onBook,
 }: ChatWorkspaceProps) {
   const backendOnline = health?.status === 'ok'
 
   return (
     <main className="flex min-h-[720px] flex-1 flex-col gap-5">
-      <Card className="border-white/70 bg-white/85">
+      <Card className="border-white/80 bg-white/88">
         <CardHeader className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <CardTitle>Conversational booking workspace</CardTitle>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-primary">
+              <Sparkles className="size-4" />
+              Event concierge
+            </div>
+            <CardTitle>{thread?.title ?? 'Start a new conversation'}</CardTitle>
             <CardDescription>
-              The main interface is already centered around chat, with the backend health
-              check confirming our local integration path.
+              Attend keeps the active filters inside the thread and updates them as the
+              conversation evolves.
             </CardDescription>
           </div>
+
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant={backendOnline ? 'success' : 'warning'}>
-              {backendOnline ? 'Backend connected' : 'Backend needs attention'}
+              {backendOnline ? 'Backend connected' : 'Backend offline'}
             </Badge>
-            <Badge>
-              {health?.database.reachable ? 'Database reachable' : 'Database not verified yet'}
+            <Badge variant={health?.database.reachable ? 'success' : 'warning'}>
+              {health?.database.reachable ? 'Database ready' : 'Database pending'}
             </Badge>
+            {thread?.status === 'booked' ? <Badge variant="success">Booking saved</Badge> : null}
           </div>
         </CardHeader>
-        <CardContent className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_280px]">
-          <section className="space-y-4 rounded-[26px] border border-border/70 bg-background/85 p-4">
-            {sampleMessages.map((message) => (
-              <div
-                key={`${message.role}-${message.content.slice(0, 24)}`}
-                className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
-              >
-                <div
-                  className={`max-w-2xl rounded-[24px] px-4 py-3 shadow-sm ${
-                    message.role === 'user'
-                      ? 'bg-primary text-primary-foreground'
-                      : 'border border-border/70 bg-card text-card-foreground'
-                  }`}
+
+        <CardContent className="space-y-4">
+          {thread?.active_filters && Object.keys(thread.active_filters).length > 0 ? (
+            <div className="flex flex-wrap gap-2 rounded-[22px] border border-border/70 bg-background/75 p-3">
+              {Object.entries(thread.active_filters).map(([key, value]) => (
+                <span
+                  key={key}
+                  className="rounded-full bg-accent/70 px-3 py-1.5 text-xs font-medium text-accent-foreground"
                 >
-                  <div className="mb-2 flex items-center gap-2 text-xs uppercase tracking-[0.2em] opacity-80">
-                    {message.role === 'assistant' ? (
-                      <Bot className="size-3.5" />
-                    ) : (
-                      <UserRound className="size-3.5" />
-                    )}
-                    <span>{message.role}</span>
-                  </div>
-                  <p className="text-sm leading-7">{message.content}</p>
+                  {formatFilterKey(key)}: {Array.isArray(value) ? value.join(', ') : value}
+                </span>
+              ))}
+            </div>
+          ) : null}
+
+          <section className="min-h-[480px] rounded-[28px] border border-border/70 bg-background/82 p-4">
+            {loadingThread ? (
+              <div className="flex min-h-[440px] items-center justify-center text-sm text-muted-foreground">
+                Loading conversation...
+              </div>
+            ) : null}
+
+            {!loadingThread && !thread ? (
+              <div className="flex min-h-[440px] flex-col items-center justify-center gap-4 text-center">
+                <div className="rounded-full bg-primary/10 p-4 text-primary">
+                  <CircleDashed className="size-6" />
+                </div>
+                <div className="space-y-2">
+                  <h2 className="font-display text-2xl text-foreground">
+                    Tell Attend what you are in the mood for
+                  </h2>
+                  <p className="max-w-lg text-sm leading-7 text-muted-foreground">
+                    Try something like “I want to watch a cricket match this Sunday in
+                    Mumbai around 7pm” and keep refining the same thread.
+                  </p>
                 </div>
               </div>
-            ))}
-          </section>
+            ) : null}
 
-          <section className="space-y-4">
-            <div className="rounded-[26px] border border-border/70 bg-background/85 p-4">
-              <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
-                <DatabaseZap className="size-4 text-primary" />
-                System status
+            {!loadingThread && thread ? (
+              <div className="flex max-h-[440px] flex-col gap-4 overflow-y-auto pr-1">
+                {thread.messages.map((message) => (
+                  <MessageBlock
+                    key={message.id}
+                    message={message}
+                    threadStatus={thread.status}
+                    bookingListingCode={bookingListingCode}
+                    onBook={onBook}
+                  />
+                ))}
               </div>
-              <dl className="space-y-3 text-sm">
-                <div className="flex items-center justify-between gap-3">
-                  <dt className="text-muted-foreground">Service</dt>
-                  <dd className="font-medium text-foreground">
-                    {health?.service ?? 'attend-backend'}
-                  </dd>
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <dt className="text-muted-foreground">Health</dt>
-                  <dd className="font-medium text-foreground">{health?.status ?? 'pending'}</dd>
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <dt className="text-muted-foreground">Database</dt>
-                  <dd className="font-medium text-foreground">
-                    {health?.database.reachable ? 'reachable' : 'checking'}
-                  </dd>
-                </div>
-              </dl>
-              {healthError ? (
-                <p className="mt-4 rounded-2xl bg-amber-500/10 px-3 py-2 text-sm text-amber-700">
-                  {healthError}
-                </p>
-              ) : null}
-            </div>
-
-            <div className="rounded-[26px] border border-dashed border-border bg-background/70 p-4 text-sm leading-6 text-muted-foreground">
-              A right-side “active filters” panel will be added in a later phase. The layout is
-              already shaped so we can slot it in cleanly.
-            </div>
+            ) : null}
           </section>
+
+          {healthError ? (
+            <div className="rounded-[22px] border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-700">
+              {healthError}
+            </div>
+          ) : null}
+
+          {actionError ? (
+            <div className="rounded-[22px] border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-700">
+              {actionError}
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
-      <Card className="border-white/70 bg-white/85">
+      <Card className="border-white/80 bg-white/88">
         <CardContent className="p-4">
           <form
             className="flex flex-col gap-3 md:flex-row"
-            onSubmit={(event) => event.preventDefault()}
+            onSubmit={(event) => {
+              event.preventDefault()
+              onSend()
+            }}
           >
             <Input
               id="message-draft"
               name="message"
               value={draft}
               onChange={(event) => onDraftChange(event.target.value)}
-              placeholder="Try: I want sports in Delhi this Sunday around 7 PM"
+              placeholder="Try: I want sports in Mumbai this Sunday around 7 PM"
+              disabled={sending}
             />
-            <Button className="md:min-w-40" type="submit">
+            <Button className="md:min-w-40" type="submit" disabled={sending || !draft.trim()}>
               <SendHorizontal className="size-4" />
-              Send
+              {sending ? 'Sending...' : 'Send'}
             </Button>
           </form>
         </CardContent>
       </Card>
     </main>
   )
+}
+
+type MessageBlockProps = {
+  message: ThreadMessage
+  threadStatus: ThreadDetail['status']
+  bookingListingCode: string | null
+  onBook: (listingCode: string) => void
+}
+
+function MessageBlock({
+  message,
+  threadStatus,
+  bookingListingCode,
+  onBook,
+}: MessageBlockProps) {
+  const isAssistant = message.role === 'assistant'
+  const resultsByDomain = message.metadata.results_by_domain ?? {}
+  const allResults = Object.values(resultsByDomain).flatMap((domain) => domain.results)
+
+  return (
+    <div className={`flex ${isAssistant ? 'justify-start' : 'justify-end'}`}>
+      <div className="max-w-3xl space-y-3">
+        <div
+          className={`rounded-[24px] px-4 py-3 shadow-sm ${
+            isAssistant
+              ? 'border border-border/70 bg-card text-card-foreground'
+              : 'bg-primary text-primary-foreground'
+          }`}
+        >
+          <div className="mb-2 flex items-center gap-2 text-xs uppercase tracking-[0.2em] opacity-80">
+            {isAssistant ? <Bot className="size-3.5" /> : <UserRound className="size-3.5" />}
+            <span>{message.role}</span>
+          </div>
+          <p className="text-sm leading-7">{message.content}</p>
+
+          {message.metadata.booking_reference ? (
+            <div className="mt-3 inline-flex items-center gap-2 rounded-full bg-emerald-500/12 px-3 py-1.5 text-xs font-semibold text-emerald-700">
+              <TicketCheck className="size-3.5" />
+              Ref {message.metadata.booking_reference}
+            </div>
+          ) : null}
+        </div>
+
+        {isAssistant && allResults.length > 0 ? (
+          <div className="grid gap-3 md:grid-cols-2">
+            {allResults.map((result) => (
+              <ResultCard
+                key={result.listing_code}
+                result={result}
+                disabled={threadStatus === 'booked'}
+                isBooking={bookingListingCode === result.listing_code}
+                onBook={onBook}
+              />
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  )
+}
+
+type ResultCardProps = {
+  result: SearchResultItem
+  disabled: boolean
+  isBooking: boolean
+  onBook: (listingCode: string) => void
+}
+
+function ResultCard({ result, disabled, isBooking, onBook }: ResultCardProps) {
+  const eventTypeLabel = result.sport_type ?? result.genres?.slice(0, 2).join(', ') ?? 'Event'
+
+  return (
+    <div className="rounded-[24px] border border-border/70 bg-white/86 p-4 shadow-sm">
+      <div className="space-y-3">
+        <div>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-base font-semibold text-foreground">{result.title}</h3>
+              <p className="mt-1 text-sm text-muted-foreground">{eventTypeLabel}</p>
+            </div>
+            <Badge variant="default">{result.listing_code}</Badge>
+          </div>
+        </div>
+
+        <div className="grid gap-2 text-sm text-muted-foreground">
+          <div className="flex items-center gap-2">
+            <MapPin className="size-4 text-primary" />
+            <span>
+              {result.venue_name}, {result.city}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <CalendarDays className="size-4 text-primary" />
+            <span>{formatEventDateTime(result.event_date, result.start_at)}</span>
+          </div>
+        </div>
+
+        {(result.min_price ?? result.max_price) ? (
+          <p className="text-sm font-medium text-foreground">
+            From Rs. {result.min_price ?? 0}
+            {result.max_price ? ` to Rs. ${result.max_price}` : ''}
+          </p>
+        ) : null}
+
+        <Button
+          type="button"
+          className="w-full"
+          disabled={disabled || isBooking}
+          onClick={() => onBook(result.listing_code)}
+        >
+          <TicketCheck className="size-4" />
+          {disabled ? 'Booking saved' : isBooking ? 'Confirming...' : 'Confirm booking'}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function formatFilterKey(value: string) {
+  return value.replace(/_/g, ' ')
+}
+
+function formatEventDateTime(eventDate: string, startAt: string) {
+  const startDate = new Date(startAt)
+  const fallbackDate = new Date(eventDate)
+  const date = Number.isNaN(startDate.getTime()) ? fallbackDate : startDate
+
+  return new Intl.DateTimeFormat('en-IN', {
+    day: 'numeric',
+    month: 'short',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(date)
 }
