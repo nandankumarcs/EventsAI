@@ -1,3 +1,27 @@
-from django.shortcuts import render
+import json
+from json import JSONDecodeError
 
-# Create your views here.
+from django.http import HttpRequest, HttpResponseNotAllowed, JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+
+from apps.agents.services import process_chat_turn
+
+
+@csrf_exempt
+def chat_turn_view(request: HttpRequest) -> JsonResponse:
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+
+    try:
+        payload = json.loads(request.body.decode("utf-8"))
+    except (JSONDecodeError, UnicodeDecodeError) as exc:
+        return JsonResponse({"error": f"Invalid chat payload: {exc}"}, status=400)
+
+    message = (payload.get("message") or "").strip()
+    thread_id = payload.get("thread_id")
+
+    if not message:
+        return JsonResponse({"error": "message is required"}, status=400)
+
+    result = process_chat_turn(user_message=message, thread_id=thread_id)
+    return JsonResponse(result)

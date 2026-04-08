@@ -23,6 +23,8 @@ def get_list(name: str, default: str) -> list[str]:
 
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
+OPENAI_RESOLVER_MODEL = os.getenv("OPENAI_RESOLVER_MODEL", "gpt-4.1-mini")
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-attend-secret-key")
 DEBUG = get_bool("DJANGO_DEBUG", True)
