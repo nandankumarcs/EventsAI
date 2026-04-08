@@ -43,6 +43,23 @@ def booking_confirm_view(request: HttpRequest) -> JsonResponse:
     if event_obj is None:
         return JsonResponse({"error": "No event found for the given listing_code"}, status=404)
 
+    existing_booking = _find_existing_booking(thread=thread, listing_code=listing_code)
+    if existing_booking is not None:
+        return JsonResponse(
+            {"booking": _serialize_booking(existing_booking), "already_confirmed": True},
+            status=200,
+        )
+
+    if thread.status == ChatThread.Status.BOOKED:
+        return JsonResponse(
+            {
+                "error": (
+                    "This thread already has a confirmed booking. Start a new thread to book another event."
+                )
+            },
+            status=409,
+        )
+
     booking = Booking.objects.create(
         thread=thread,
         booking_reference=_generate_booking_reference(),
@@ -82,6 +99,14 @@ def booking_confirm_view(request: HttpRequest) -> JsonResponse:
     )
 
     return JsonResponse({"booking": _serialize_booking(booking)}, status=201)
+
+
+def _find_existing_booking(*, thread: ChatThread, listing_code: str) -> Booking | None:
+    for booking in thread.bookings.all().order_by("-confirmed_at"):
+        event_snapshot = booking.event_snapshot or {}
+        if event_snapshot.get("listing_code") == listing_code:
+            return booking
+    return None
 
 
 def _resolve_event_by_listing_code(listing_code: str):

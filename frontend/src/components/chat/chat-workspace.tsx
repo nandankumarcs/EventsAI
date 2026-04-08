@@ -3,6 +3,7 @@ import {
   CalendarDays,
   CircleDashed,
   MapPin,
+  Plus,
   SendHorizontal,
   Sparkles,
   TicketCheck,
@@ -24,9 +25,11 @@ type ChatWorkspaceProps = {
   health: HealthResponse | null
   healthError: string | null
   actionError: string | null
+  isCreatingThread: boolean
   onDraftChange: (value: string) => void
   onSend: () => void
   onBook: (listingCode: string) => void
+  onCreateThread: () => void
 }
 
 export function ChatWorkspace({
@@ -38,11 +41,14 @@ export function ChatWorkspace({
   health,
   healthError,
   actionError,
+  isCreatingThread,
   onDraftChange,
   onSend,
   onBook,
+  onCreateThread,
 }: ChatWorkspaceProps) {
   const backendOnline = health?.status === 'ok'
+  const isBookedThread = thread?.status === 'booked'
 
   return (
     <main className="flex min-h-[720px] flex-1 flex-col gap-5">
@@ -73,15 +79,40 @@ export function ChatWorkspace({
 
         <CardContent className="space-y-4">
           {thread?.active_filters && Object.keys(thread.active_filters).length > 0 ? (
-            <div className="flex flex-wrap gap-2 rounded-[22px] border border-border/70 bg-background/75 p-3">
-              {Object.entries(thread.active_filters).map(([key, value]) => (
-                <span
-                  key={key}
-                  className="rounded-full bg-accent/70 px-3 py-1.5 text-xs font-medium text-accent-foreground"
-                >
-                  {formatFilterKey(key)}: {Array.isArray(value) ? value.join(', ') : value}
-                </span>
-              ))}
+            <div className="space-y-2 rounded-[22px] border border-border/70 bg-background/75 p-3">
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                Active filters
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {Object.entries(thread.active_filters).map(([key, value]) => (
+                  <span
+                    key={key}
+                    className="rounded-full bg-accent/70 px-3 py-1.5 text-xs font-medium text-accent-foreground"
+                  >
+                    {formatFilterKey(key)}: {Array.isArray(value) ? value.join(', ') : value}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          {isBookedThread ? (
+            <div className="flex flex-col gap-3 rounded-[22px] border border-emerald-500/20 bg-emerald-500/8 px-4 py-4 text-sm text-emerald-900 sm:flex-row sm:items-center sm:justify-between">
+              <div className="space-y-1">
+                <p className="font-semibold">This booking journey is complete.</p>
+                <p className="text-emerald-800/80">
+                  Start a fresh thread when you want to plan another movie or match.
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isCreatingThread}
+                onClick={onCreateThread}
+              >
+                <Plus className="size-4" />
+                {isCreatingThread ? 'Opening...' : 'New thread'}
+              </Button>
             </div>
           ) : null}
 
@@ -140,26 +171,46 @@ export function ChatWorkspace({
 
       <Card className="border-white/80 bg-white/88">
         <CardContent className="p-4">
-          <form
-            className="flex flex-col gap-3 md:flex-row"
-            onSubmit={(event) => {
-              event.preventDefault()
-              onSend()
-            }}
-          >
-            <Input
-              id="message-draft"
-              name="message"
-              value={draft}
-              onChange={(event) => onDraftChange(event.target.value)}
-              placeholder="Try: I want sports in Mumbai this Sunday around 7 PM"
-              disabled={sending}
-            />
-            <Button className="md:min-w-40" type="submit" disabled={sending || !draft.trim()}>
-              <SendHorizontal className="size-4" />
-              {sending ? 'Sending...' : 'Send'}
-            </Button>
-          </form>
+          {isBookedThread ? (
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div className="space-y-1">
+                <p className="text-sm font-medium text-foreground">This thread is read-only now.</p>
+                <p className="text-sm text-muted-foreground">
+                  Use a new thread to search with a fresh set of filters.
+                </p>
+              </div>
+              <Button
+                type="button"
+                className="md:min-w-40"
+                disabled={isCreatingThread}
+                onClick={onCreateThread}
+              >
+                <Plus className="size-4" />
+                {isCreatingThread ? 'Opening...' : 'Start new thread'}
+              </Button>
+            </div>
+          ) : (
+            <form
+              className="flex flex-col gap-3 md:flex-row"
+              onSubmit={(event) => {
+                event.preventDefault()
+                onSend()
+              }}
+            >
+              <Input
+                id="message-draft"
+                name="message"
+                value={draft}
+                onChange={(event) => onDraftChange(event.target.value)}
+                placeholder="Try: I want sports in Mumbai this Sunday around 7 PM"
+                disabled={sending}
+              />
+              <Button className="md:min-w-40" type="submit" disabled={sending || !draft.trim()}>
+                <SendHorizontal className="size-4" />
+                {sending ? 'Sending...' : 'Send'}
+              </Button>
+            </form>
+          )}
         </CardContent>
       </Card>
     </main>
@@ -283,7 +334,9 @@ function ResultCard({ result, disabled, isBooking, onBook }: ResultCardProps) {
 }
 
 function formatFilterKey(value: string) {
-  return value.replace(/_/g, ' ')
+  return value
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (character) => character.toUpperCase())
 }
 
 function formatEventDateTime(eventDate: string, startAt: string) {

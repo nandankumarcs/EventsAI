@@ -185,11 +185,14 @@ export async function sendChatMessage(message: string, threadId?: string) {
 }
 
 export async function confirmBooking(threadId: string, listingCode: string) {
-  return request<{ booking: BookingSummary }>('/api/bookings/confirm/', {
-    method: 'POST',
-    body: JSON.stringify({
-      thread_id: threadId,
-      listing_code: listingCode,
-    }),
-  })
+  return request<{ booking: BookingSummary; already_confirmed?: boolean }>(
+    '/api/bookings/confirm/',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        thread_id: threadId,
+        listing_code: listingCode,
+      }),
+    },
+  )
 }

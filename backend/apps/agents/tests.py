@@ -4,7 +4,7 @@ from django.test import TestCase
 
 from apps.agents.langchain_tools import TurnResolution
 from apps.agents.schemas import ActiveFilters
-from apps.agents.services import _derive_filters_to_clear, process_chat_turn
+from apps.agents.services import ChatTurnError, _derive_filters_to_clear, process_chat_turn
 from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
 
 
@@ -90,6 +90,21 @@ class AgentServiceTests(TestCase):
         self.assertEqual(payload["active_filters"]["cities"], ["Mumbai"])
         self.assertEqual(payload["active_filters"]["sport_types"], ["Cricket"])
 
+    @patch("apps.agents.services.resolve_turn_filters")
+    def test_process_chat_turn_rejects_booked_threads(self, resolve_turn_filters_mock):
+        thread = ChatThread.objects.create(
+            title="Booked thread",
+            status=ChatThread.Status.BOOKED,
+        )
+
+        with self.assertRaisesMessage(
+            ChatTurnError,
+            "This thread already has a confirmed booking. Start a new thread to plan another event.",
+        ):
+            process_chat_turn(user_message="Actually show me Mumbai", thread_id=str(thread.id))
+
+        resolve_turn_filters_mock.assert_not_called()
+
 
 class AgentLogicTests(TestCase):
     def test_derive_filters_to_clear_on_domain_switch_clears_domain_specific_and_shared_keys(self):
@@ -122,3 +137,19 @@ class AgentViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["thread"]["id"], "abc")
+
+    @patch("apps.agents.views.process_chat_turn")
+    def test_chat_turn_endpoint_returns_conflict_for_closed_thread(self, process_chat_turn_mock):
+        process_chat_turn_mock.side_effect = ChatTurnError(
+            "This thread already has a confirmed booking. Start a new thread to plan another event.",
+            status_code=409,
+        )
+
+        response = self.client.post(
+            "/api/agents/chat/",
+            data='{"message":"Show me something else","thread_id":"abc"}',
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("confirmed booking", response.json()["error"])

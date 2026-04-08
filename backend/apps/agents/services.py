@@ -31,9 +31,19 @@ SHARED_SWITCH_CLEAR_KEYS = {
 }
 
 
+class ChatTurnError(Exception):
+    status_code = 400
+
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        if status_code is not None:
+            self.status_code = status_code
+
+
 def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dict[str, Any]:
     reference_date = timezone.localdate().isoformat()
     thread, _created = _get_or_create_thread(user_message=user_message, thread_id=thread_id)
+    _assert_thread_accepts_messages(thread)
     thread_filter = _get_or_create_thread_filter(thread)
     current_filters = ActiveFilters.model_validate(thread_filter.active_filters or {})
 
@@ -115,6 +125,19 @@ def _get_or_create_thread(*, user_message: str, thread_id: str | None) -> tuple[
         last_activity_at=timezone.now(),
     )
     return thread, True
+
+
+def _assert_thread_accepts_messages(thread: ChatThread) -> None:
+    if thread.status == ChatThread.Status.BOOKED:
+        raise ChatTurnError(
+            "This thread already has a confirmed booking. Start a new thread to plan another event.",
+            status_code=409,
+        )
+    if thread.status == ChatThread.Status.ARCHIVED:
+        raise ChatTurnError(
+            "This thread is archived and cannot accept new messages.",
+            status_code=409,
+        )
 
 
 def _get_or_create_thread_filter(thread: ChatThread) -> ThreadFilter:

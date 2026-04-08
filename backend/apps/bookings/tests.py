@@ -90,3 +90,34 @@ class BookingApiTests(TestCase):
         payload = response.json()
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["bookings"][0]["event_title"], "Stree 2")
+
+    def test_booking_confirm_is_idempotent_for_same_thread_and_listing(self):
+        thread = ChatThread.objects.create(title="Book Stree 2")
+
+        first_response = self.client.post(
+            "/api/bookings/confirm/",
+            data=json.dumps({"thread_id": str(thread.id), "listing_code": self.movie_event.listing_code}),
+            content_type="application/json",
+        )
+        second_response = self.client.post(
+            "/api/bookings/confirm/",
+            data=json.dumps({"thread_id": str(thread.id), "listing_code": self.movie_event.listing_code}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(first_response.status_code, 201)
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(Booking.objects.count(), 1)
+        self.assertTrue(second_response.json()["already_confirmed"])
+
+    def test_booking_confirm_rejects_new_listing_for_booked_thread(self):
+        thread = ChatThread.objects.create(title="Booked thread", status=ChatThread.Status.BOOKED)
+
+        response = self.client.post(
+            "/api/bookings/confirm/",
+            data=json.dumps({"thread_id": str(thread.id), "listing_code": self.movie_event.listing_code}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("already has a confirmed booking", response.json()["error"])

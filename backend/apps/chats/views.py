@@ -13,7 +13,7 @@ def thread_list_create_view(request: HttpRequest) -> JsonResponse:
     if request.method == "GET":
         threads = [
             _serialize_thread_summary(thread)
-            for thread in ChatThread.objects.all().prefetch_related("messages")
+            for thread in ChatThread.objects.select_related("filter_state").prefetch_related("messages")
         ]
         return JsonResponse({"count": len(threads), "threads": threads})
 
@@ -40,7 +40,7 @@ def thread_detail_view(request: HttpRequest, thread_id) -> JsonResponse:
         return HttpResponseNotAllowed(["GET"])
 
     thread = get_object_or_404(
-        ChatThread.objects.prefetch_related("messages"),
+        ChatThread.objects.select_related("filter_state").prefetch_related("messages"),
         id=thread_id,
     )
     return JsonResponse({"thread": _serialize_thread_detail(thread)})

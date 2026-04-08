@@ -4,7 +4,7 @@ from json import JSONDecodeError
 from django.http import HttpRequest, HttpResponseNotAllowed, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from apps.agents.services import process_chat_turn
+from apps.agents.services import ChatTurnError, process_chat_turn
 
 
 @csrf_exempt
@@ -23,5 +23,8 @@ def chat_turn_view(request: HttpRequest) -> JsonResponse:
     if not message:
         return JsonResponse({"error": "message is required"}, status=400)
 
-    result = process_chat_turn(user_message=message, thread_id=thread_id)
+    try:
+        result = process_chat_turn(user_message=message, thread_id=thread_id)
+    except ChatTurnError as exc:
+        return JsonResponse({"error": str(exc)}, status=exc.status_code)
     return JsonResponse(result)

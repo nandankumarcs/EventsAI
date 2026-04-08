@@ -138,6 +138,12 @@ function App() {
     if (!message) {
       return
     }
+    if (selectedThread?.status === 'booked') {
+      setActionError(
+        'This thread already has a confirmed booking. Start a new thread to plan another event.',
+      )
+      return
+    }
 
     setSending(true)
     setActionError(null)
@@ -196,9 +202,11 @@ function App() {
           health={health}
           healthError={healthError}
           actionError={actionError}
+          isCreatingThread={creatingThread}
           onDraftChange={setDraft}
           onSend={handleSend}
           onBook={handleBook}
+          onCreateThread={handleCreateThread}
         />
       </div>
     </div>
