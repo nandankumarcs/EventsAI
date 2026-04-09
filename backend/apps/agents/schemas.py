@@ -44,6 +44,7 @@ class FilterResolution(BaseModel):
     status: Literal["resolved", "no_match", "ambiguous", "no_input"] = "no_input"
     message: str = ""
     active_filters_partial: ActiveFilters = Field(default_factory=ActiveFilters)
+    clear_fields: list[str] = Field(default_factory=list)
     confidence: float | None = None
     candidates: list[str] = Field(default_factory=list)
 

@@ -23,7 +23,7 @@ def health_check(request):
     return JsonResponse(
         {
             "status": status,
-            "service": "attend-backend",
+            "service": "eventsai-backend",
             "timestamp": timezone.now().isoformat(),
             "database": database,
         }

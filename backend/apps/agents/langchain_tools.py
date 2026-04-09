@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 class TurnResolution:
     updates: ActiveFilters
     tool_trace: list[str]
+    clear_fields: list[str] = field(default_factory=list)
     issues: list["ResolutionIssue"] = field(default_factory=list)
 
 
@@ -121,11 +122,13 @@ def _build_location_agent():
         response_format=ToolStrategy(FilterResolution),
         system_prompt=(
             "You resolve city filters from the user request.\n"
-            "The user message is provided as JSON with user_message and allowed_domains.\n"
+            "The user message is provided as JSON with user_message, allowed_domains, and current_filters.\n"
             "You must inspect the available city tools before deciding.\n"
             "Return only exact canonical city values from the tool outputs in active_filters_partial.cities.\n"
             "Map informal wording to the closest canonical city only when it is clearly the user's intent.\n"
-            "Do not return lowercase variants. Do not invent cities. Do not infer venues or teams from a city mention."
+            "Do not return lowercase variants. Do not invent cities. Do not infer venues or teams from a city mention.\n"
+            "If the user asks to remove, exclude, or go outside the current city filter, return status resolved with clear_fields set to ['cities'] and leave active_filters_partial.cities empty.\n"
+            "If the user replaces one city with another, return only the replacement city value.\n"
         ),
     )
 
@@ -191,15 +194,17 @@ def _build_temporal_agent():
         response_format=ToolStrategy(FilterResolution),
         system_prompt=(
             "You resolve temporal filters from the user request.\n"
-            "The user message is provided as JSON with user_message and reference_date.\n"
+            "The user message is provided as JSON with user_message, reference_date, and current_filters.\n"
             "You must use tools for any calendar or clock calculation. Do not do date math in your head.\n"
             "Use exact-date mode for discrete dates like 'today', 'tomorrow', 'this sunday', 'sunday or monday', or named weekdays.\n"
-            "In exact-date mode, populate active_filters_partial.event_dates and leave date_from/date_to empty.\n"
+            "In exact-date mode, populate active_filters_partial.event_dates, set clear_fields to ['date_from', 'date_to'], and leave date_from/date_to empty.\n"
             "Use range mode for phrases like 'after', 'before', 'from', 'until', 'next week', 'this week', 'next month', or 'after 13th this month'.\n"
-            "In range mode, populate date_from/date_to and leave event_dates empty.\n"
+            "In range mode, populate date_from/date_to, set clear_fields to ['event_dates'], and leave event_dates empty.\n"
             "For 'after X', date_from should be the first included day after X unless the user explicitly says 'on or after'.\n"
             "For 'around 7pm' or similar exact times, normalize the time first and then build a practical window.\n"
             "For broad periods like evening or night, use the named time bucket tool.\n"
+            "If the user asks to remove a date, day, date range, or time filter, return status resolved with the matching clear_fields and no replacement values.\n"
+            "Never return event_dates together with date_from/date_to in the same response.\n"
             "Return only event_dates, date_from, date_to, start_time_from, and start_time_to in active_filters_partial.\n"
             "If the message contains no temporal intent, return status no_input.\n"
             "Return no_input if the message contains no temporal intent."
@@ -276,9 +281,11 @@ def _build_movie_filter_agent():
         response_format=ToolStrategy(FilterResolution),
         system_prompt=(
             "You resolve movie-specific filters from the user request.\n"
+            "The user message is provided as JSON with user_message and current_filters.\n"
             "You must rely on the tool outputs and return only exact canonical values from them.\n"
             "Only resolve values the user explicitly requested or clearly described.\n"
             "Do not infer a venue, title, genre, or language from a city mention alone.\n"
+            "If the user explicitly removes a movie filter like language, venue, genre, format, or title, return status resolved with the relevant clear_fields and no replacement value for that field.\n"
             "Return titles, genres, cast_members, directors, certifications, languages, venue_names, formats, franchises, and content_origins in active_filters_partial.\n"
             "If the message contains no movie-specific filter intent, return no_input."
         ),
@@ -372,9 +379,11 @@ def _build_sport_filter_agent():
         response_format=ToolStrategy(FilterResolution),
         system_prompt=(
             "You resolve sport-specific filters from the user request.\n"
+            "The user message is provided as JSON with user_message and current_filters.\n"
             "You must rely on the tool outputs and return only exact canonical values from them.\n"
             "Only resolve a sport type, tournament, team, venue, or athlete when the user explicitly requests it or clearly describes it.\n"
             "Do not infer teams or venues from a city mention. For example, a message like 'Mumbai works better' updates city only and should not set teams or venues.\n"
+            "If the user explicitly removes a sports filter like sport type, tournament, team, or venue, return status resolved with the relevant clear_fields and no replacement value for that field.\n"
             "Return sport_types, tournament_names, season_labels, competition_stages, format_labels, home_teams, away_teams, teams, participant_names, venue_names, featured_athletes, organizers, and match_numbers in active_filters_partial.\n"
             "If the message contains no sport-specific filter intent, return no_input."
         ),
@@ -413,10 +422,20 @@ def invoke_event_type_resolver(user_message: str) -> FilterResolution:
     )
 
 
-def invoke_location_resolver(user_message: str, domains: list[str] | None = None) -> FilterResolution:
+def invoke_location_resolver(
+    user_message: str,
+    domains: list[str] | None = None,
+    current_filters: ActiveFilters | None = None,
+) -> FilterResolution:
     resolution = _invoke_filter_resolution_agent(
         agent=_build_location_agent(),
-        user_content=json.dumps({"user_message": user_message, "allowed_domains": domains or []}),
+        user_content=json.dumps(
+            {
+                "user_message": user_message,
+                "allowed_domains": domains or [],
+                "current_filters": (current_filters or ActiveFilters()).model_dump(),
+            }
+        ),
         trace_name="resolve_location",
         allowed_fields={"cities"},
     )
@@ -425,13 +444,14 @@ def invoke_location_resolver(user_message: str, domains: list[str] | None = None
     return resolution
 
 
-def invoke_temporal_resolver(user_message: str, reference_date: str) -> FilterResolution:
-    return _invoke_filter_resolution_agent(
+def invoke_temporal_resolver(user_message: str, reference_date: str, current_filters: ActiveFilters | None = None) -> FilterResolution:
+    resolution = _invoke_filter_resolution_agent(
         agent=_build_temporal_agent(),
         user_content=json.dumps(
             {
                 "user_message": user_message,
                 "reference_date": reference_date,
+                "current_filters": (current_filters or ActiveFilters()).model_dump(),
             }
         ),
         trace_name="resolve_temporal",
@@ -443,12 +463,18 @@ def invoke_temporal_resolver(user_message: str, reference_date: str) -> FilterRe
             "start_time_to",
         },
     )
+    return _sanitize_temporal_resolution(resolution)
 
 
-def invoke_movie_filter_resolver(user_message: str) -> FilterResolution:
+def invoke_movie_filter_resolver(user_message: str, current_filters: ActiveFilters | None = None) -> FilterResolution:
     resolution = _invoke_filter_resolution_agent(
         agent=_build_movie_filter_agent(),
-        user_content=json.dumps({"user_message": user_message}),
+        user_content=json.dumps(
+            {
+                "user_message": user_message,
+                "current_filters": (current_filters or ActiveFilters()).model_dump(),
+            }
+        ),
         trace_name="resolve_movie_filters",
         allowed_fields={
             "titles",
@@ -470,10 +496,15 @@ def invoke_movie_filter_resolver(user_message: str) -> FilterResolution:
     )
 
 
-def invoke_sport_filter_resolver(user_message: str) -> FilterResolution:
+def invoke_sport_filter_resolver(user_message: str, current_filters: ActiveFilters | None = None) -> FilterResolution:
     resolution = _invoke_filter_resolution_agent(
         agent=_build_sport_filter_agent(),
-        user_content=json.dumps({"user_message": user_message}),
+        user_content=json.dumps(
+            {
+                "user_message": user_message,
+                "current_filters": (current_filters or ActiveFilters()).model_dump(),
+            }
+        ),
         trace_name="resolve_sport_filters",
         allowed_fields={
             "sport_types",
@@ -535,9 +566,12 @@ def resolve_turn_filters(
 ) -> TurnResolution:
     trace: list[str] = []
     updates = ActiveFilters()
+    clear_fields: list[str] = []
     issues: list[ResolutionIssue] = []
     current_domains = current_filters.event_types
     domain_switched = False
+    movie_resolution: FilterResolution | None = None
+    sport_resolution: FilterResolution | None = None
 
     event_type_resolution = invoke_event_type_resolver(user_message)
     trace.append("resolve_event_type")
@@ -556,9 +590,39 @@ def resolve_turn_filters(
 
     effective_domains = updates.event_types or current_domains
 
-    location_resolution = invoke_location_resolver(user_message, effective_domains or None)
+    if not effective_domains:
+        movie_resolution = invoke_movie_filter_resolver(user_message, current_filters=current_filters)
+        trace.append("resolve_movie_filters")
+        sport_resolution = invoke_sport_filter_resolver(user_message, current_filters=current_filters)
+        trace.append("resolve_sport_filters")
+
+        inferred_domains = _infer_domains_from_specific_resolvers(
+            movie_resolution=movie_resolution,
+            sport_resolution=sport_resolution,
+        )
+        if inferred_domains:
+            effective_domains = inferred_domains
+            updates = _merge_active_filters(
+                updates,
+                ActiveFilters(event_types=inferred_domains),
+            )
+            clear_fields.extend(["event_types"])
+            if inferred_domains == ["movies"]:
+                updates = _merge_active_filters(updates, _partial_from_resolution(movie_resolution))
+                clear_fields = _merge_clear_fields(clear_fields, movie_resolution.clear_fields)
+            if inferred_domains == ["sports"]:
+                updates = _merge_active_filters(updates, _partial_from_resolution(sport_resolution))
+                clear_fields = _merge_clear_fields(clear_fields, sport_resolution.clear_fields)
+
+    location_resolution = invoke_location_resolver(user_message, effective_domains or None, current_filters)
+    location_resolution = _apply_location_clear_fallback(
+        resolution=location_resolution,
+        user_message=user_message,
+        current_filters=current_filters,
+    )
     trace.append("resolve_location")
     updates = _merge_active_filters(updates, _partial_from_resolution(location_resolution))
+    clear_fields = _merge_clear_fields(clear_fields, location_resolution.clear_fields)
     _append_resolution_issue(
         issues=issues,
         resolution=location_resolution,
@@ -566,14 +630,17 @@ def resolve_turn_filters(
         filter_label="location",
     )
 
-    temporal_resolution = invoke_temporal_resolver(user_message, reference_date)
+    temporal_resolution = invoke_temporal_resolver(user_message, reference_date, current_filters)
     trace.append("resolve_temporal")
     updates = _merge_active_filters(updates, _partial_from_resolution(temporal_resolution))
+    clear_fields = _merge_clear_fields(clear_fields, temporal_resolution.clear_fields)
 
     if "movies" in effective_domains:
-        movie_resolution = invoke_movie_filter_resolver(user_message)
-        trace.append("resolve_movie_filters")
+        if movie_resolution is None:
+            movie_resolution = invoke_movie_filter_resolver(user_message, current_filters=current_filters)
+            trace.append("resolve_movie_filters")
         updates = _merge_active_filters(updates, _partial_from_resolution(movie_resolution))
+        clear_fields = _merge_clear_fields(clear_fields, movie_resolution.clear_fields)
         _append_resolution_issue(
             issues=issues,
             resolution=movie_resolution,
@@ -582,7 +649,7 @@ def resolve_turn_filters(
         )
 
     if "sports" in effective_domains:
-        if not domain_switched:
+        if not domain_switched and _should_run_sport_catalog_inquiry(user_message):
             sport_catalog_inquiry = invoke_sport_catalog_inquiry(user_message)
             if sport_catalog_inquiry.status == "answer":
                 trace.append("resolve_sport_catalog_inquiry")
@@ -590,11 +657,13 @@ def resolve_turn_filters(
                     updates,
                     ActiveFilters(sport_types=sport_catalog_inquiry.listed_values),
                 )
-                return TurnResolution(updates=updates, tool_trace=trace, issues=issues)
+                return TurnResolution(updates=updates, tool_trace=trace, clear_fields=clear_fields, issues=issues)
 
-        sport_resolution = invoke_sport_filter_resolver(user_message)
-        trace.append("resolve_sport_filters")
+        if sport_resolution is None:
+            sport_resolution = invoke_sport_filter_resolver(user_message, current_filters=current_filters)
+            trace.append("resolve_sport_filters")
         updates = _merge_active_filters(updates, _partial_from_resolution(sport_resolution))
+        clear_fields = _merge_clear_fields(clear_fields, sport_resolution.clear_fields)
         _append_resolution_issue(
             issues=issues,
             resolution=sport_resolution,
@@ -602,7 +671,7 @@ def resolve_turn_filters(
             filter_label="sports filters",
         )
 
-    return TurnResolution(updates=updates, tool_trace=trace, issues=issues)
+    return TurnResolution(updates=updates, tool_trace=trace, clear_fields=clear_fields, issues=issues)
 
 
 def _invoke_filter_resolution_agent(*, agent, user_content: str, trace_name: str, allowed_fields: set[str]) -> FilterResolution:
@@ -636,9 +705,11 @@ def _constrain_resolution(resolution: FilterResolution, allowed_fields: set[str]
         for key, value in resolution.active_filters_partial.model_dump().items()
         if key in allowed_fields and value not in (None, [], "")
     }
+    clear_fields = [field_name for field_name in resolution.clear_fields if field_name in allowed_fields]
     return FilterResolution(
         status=resolution.status,
         message=resolution.message,
+        clear_fields=clear_fields,
         confidence=resolution.confidence,
         candidates=resolution.candidates,
         active_filters_partial=ActiveFilters.model_validate(partial_payload),
@@ -663,6 +734,7 @@ def _sanitize_explicit_entity_fields(
     return FilterResolution(
         status=resolution.status if has_filters else "no_input",
         message=resolution.message,
+        clear_fields=resolution.clear_fields,
         confidence=resolution.confidence,
         candidates=resolution.candidates,
         active_filters_partial=sanitized_partial,
@@ -676,6 +748,10 @@ def _merge_active_filters(base: ActiveFilters, updates: ActiveFilters) -> Active
             continue
         merged[key] = value
     return ActiveFilters.model_validate(merged)
+
+
+def _merge_clear_fields(base: list[str], extra: list[str]) -> list[str]:
+    return list(dict.fromkeys([*base, *extra]))
 
 
 def _append_resolution_issue(
@@ -714,6 +790,94 @@ def _should_apply_event_type_resolution(
         return bool(resolved_domains and resolved_domains != [current_domain])
 
     return False
+
+
+def _sanitize_temporal_resolution(resolution: FilterResolution) -> FilterResolution:
+    partial = resolution.active_filters_partial.model_dump()
+    clear_fields = list(resolution.clear_fields)
+
+    has_event_dates = bool(partial.get("event_dates"))
+    has_date_range = bool(partial.get("date_from") or partial.get("date_to"))
+
+    if has_event_dates:
+        partial["date_from"] = None
+        partial["date_to"] = None
+        clear_fields = _merge_clear_fields(clear_fields, ["date_from", "date_to"])
+    elif has_date_range:
+        partial["event_dates"] = []
+        clear_fields = _merge_clear_fields(clear_fields, ["event_dates"])
+
+    sanitized_partial = ActiveFilters.model_validate(partial)
+    has_filters = any(value not in (None, [], "") for value in sanitized_partial.model_dump().values())
+    return FilterResolution(
+        status=resolution.status if has_filters or clear_fields else "no_input",
+        message=resolution.message,
+        clear_fields=clear_fields,
+        confidence=resolution.confidence,
+        candidates=resolution.candidates,
+        active_filters_partial=sanitized_partial,
+    )
+
+
+def _apply_location_clear_fallback(
+    *,
+    resolution: FilterResolution,
+    user_message: str,
+    current_filters: ActiveFilters,
+) -> FilterResolution:
+    if resolution.clear_fields or resolution.status == "resolved":
+        return resolution
+
+    normalized_message = _normalize_text(user_message)
+    removal_phrases = ("outside", "not in", "without", "exclude")
+    if not any(phrase in normalized_message for phrase in removal_phrases):
+        return resolution
+
+    for city in current_filters.cities:
+        if _normalize_text(city) in normalized_message:
+            return FilterResolution(status="resolved", clear_fields=["cities"])
+
+    return resolution
+
+
+def _should_run_sport_catalog_inquiry(user_message: str) -> bool:
+    normalized_message = _normalize_text(user_message)
+    if "sport" not in normalized_message:
+        return False
+
+    inquiry_cues = (
+        "what",
+        "which",
+        "other",
+        "available",
+        "options",
+        "alternatives",
+        "do we have",
+        "do you have",
+    )
+    return any(cue in normalized_message for cue in inquiry_cues)
+
+
+def _infer_domains_from_specific_resolvers(
+    *,
+    movie_resolution: FilterResolution,
+    sport_resolution: FilterResolution,
+) -> list[str]:
+    movie_has_filters = _resolution_has_filters(movie_resolution)
+    sport_has_filters = _resolution_has_filters(sport_resolution)
+
+    if movie_has_filters and not sport_has_filters:
+        return ["movies"]
+    if sport_has_filters and not movie_has_filters:
+        return ["sports"]
+    return []
+
+
+def _resolution_has_filters(resolution: FilterResolution) -> bool:
+    return any(
+        value not in (None, [], "")
+        for value in resolution.active_filters_partial.model_dump().values()
+    )
 
 
 def _looks_explicit_in_message(user_message: str, candidate_value: str) -> bool:

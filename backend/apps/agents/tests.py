@@ -99,6 +99,32 @@ class AgentServiceTests(TestCase):
         self.assertEqual(payload["active_filters"]["sport_types"], ["Cricket"])
 
     @patch("apps.agents.services.resolve_turn_filters")
+    def test_process_chat_turn_clears_filters_returned_by_resolvers(self, resolve_turn_filters_mock):
+        thread = ChatThread.objects.create(title="Existing thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={
+                "event_types": ["sports"],
+                "cities": ["Mumbai"],
+                "event_dates": ["2026-04-12"],
+                "sport_types": ["Cricket"],
+            },
+        )
+        resolve_turn_filters_mock.return_value = TurnResolution(
+            updates=ActiveFilters(date_from="2026-04-07", date_to="2026-04-12"),
+            clear_fields=["cities", "event_dates"],
+            tool_trace=["resolve_location", "resolve_temporal"],
+        )
+
+        payload = process_chat_turn(user_message="remove the mumbai filter and show matches this week", thread_id=str(thread.id))
+
+        self.assertNotIn("cities", payload["active_filters"])
+        self.assertNotIn("event_dates", payload["active_filters"])
+        self.assertEqual(payload["active_filters"]["date_from"], "2026-04-07")
+        self.assertEqual(payload["active_filters"]["date_to"], "2026-04-12")
+        self.assertEqual(payload["active_filters"]["sport_types"], ["Cricket"])
+
+    @patch("apps.agents.services.resolve_turn_filters")
     def test_process_chat_turn_returns_no_match_reply_without_broad_fallback(self, resolve_turn_filters_mock):
         resolve_turn_filters_mock.return_value = TurnResolution(
             updates=ActiveFilters(event_types=["sports"], cities=["Mumbai"]),
@@ -277,6 +303,7 @@ class AgentLogicTests(TestCase):
         self.assertIn("languages", result)
 
     @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_movie_filter_resolver")
     @patch("apps.agents.langchain_tools.invoke_sport_catalog_inquiry")
     @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
     @patch("apps.agents.langchain_tools.invoke_location_resolver")
@@ -287,6 +314,7 @@ class AgentLogicTests(TestCase):
         location_resolver_mock,
         temporal_resolver_mock,
         sport_catalog_inquiry_mock,
+        movie_filter_resolver_mock,
         sport_filter_resolver_mock,
     ):
         event_type_resolver_mock.return_value = FilterResolution(
@@ -296,6 +324,7 @@ class AgentLogicTests(TestCase):
         location_resolver_mock.return_value = FilterResolution(status="no_input")
         temporal_resolver_mock.return_value = FilterResolution(status="no_input")
         sport_catalog_inquiry_mock.return_value = CatalogInquiry(status="no_input")
+        movie_filter_resolver_mock.return_value = FilterResolution(status="no_input")
         sport_filter_resolver_mock.return_value = FilterResolution(
             status="resolved",
             message="Resolved sport type.",
@@ -311,6 +340,232 @@ class AgentLogicTests(TestCase):
         self.assertEqual(result.updates.sport_types, ["Cricket"])
         self.assertEqual(result.updates.event_types, [])
         self.assertEqual(result.issues, [])
+
+    @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_movie_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
+    @patch("apps.agents.langchain_tools.invoke_location_resolver")
+    @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    def test_resolve_turn_filters_infers_sports_domain_from_specific_filter_when_event_type_is_missing(
+        self,
+        event_type_resolver_mock,
+        location_resolver_mock,
+        temporal_resolver_mock,
+        movie_filter_resolver_mock,
+        sport_filter_resolver_mock,
+    ):
+        event_type_resolver_mock.return_value = FilterResolution(status="no_input")
+        movie_filter_resolver_mock.return_value = FilterResolution(status="no_input")
+        sport_filter_resolver_mock.return_value = FilterResolution(
+            status="resolved",
+            message="Resolved sport type.",
+            active_filters_partial=ActiveFilters(sport_types=["Cricket"]),
+        )
+        location_resolver_mock.return_value = FilterResolution(
+            status="resolved",
+            message="Resolved location.",
+            active_filters_partial=ActiveFilters(cities=["Mumbai"]),
+        )
+        temporal_resolver_mock.return_value = FilterResolution(
+            status="resolved",
+            message="Resolved date.",
+            active_filters_partial=ActiveFilters(event_dates=["2026-04-12"]),
+        )
+
+        result = resolve_turn_filters(
+            user_message="is there a cricket event this sunday in Mumbai?",
+            current_filters=ActiveFilters(),
+            reference_date="2026-04-09",
+        )
+
+        self.assertEqual(result.updates.event_types, ["sports"])
+        self.assertEqual(result.updates.sport_types, ["Cricket"])
+        self.assertEqual(result.updates.cities, ["Mumbai"])
+        self.assertEqual(result.updates.event_dates, ["2026-04-12"])
+        location_resolver_mock.assert_called_once()
+        self.assertEqual(
+            location_resolver_mock.call_args.args,
+            ("is there a cricket event this sunday in Mumbai?", ["sports"], ActiveFilters()),
+        )
+
+    @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_movie_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
+    @patch("apps.agents.langchain_tools.invoke_location_resolver")
+    @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    def test_resolve_turn_filters_infers_movie_domain_from_specific_filter_when_event_type_is_missing(
+        self,
+        event_type_resolver_mock,
+        location_resolver_mock,
+        temporal_resolver_mock,
+        movie_filter_resolver_mock,
+        sport_filter_resolver_mock,
+    ):
+        event_type_resolver_mock.return_value = FilterResolution(status="no_input")
+        movie_filter_resolver_mock.return_value = FilterResolution(
+            status="resolved",
+            message="Resolved movie venue.",
+            active_filters_partial=ActiveFilters(venue_names=["PVR Phoenix"]),
+        )
+        sport_filter_resolver_mock.return_value = FilterResolution(status="no_input")
+        location_resolver_mock.return_value = FilterResolution(status="no_input")
+        temporal_resolver_mock.return_value = FilterResolution(status="no_input")
+
+        result = resolve_turn_filters(
+            user_message="in PVR Phoenix",
+            current_filters=ActiveFilters(),
+            reference_date="2026-04-09",
+        )
+
+        self.assertEqual(result.updates.event_types, ["movies"])
+        self.assertEqual(result.updates.venue_names, ["PVR Phoenix"])
+        location_resolver_mock.assert_called_once()
+        self.assertEqual(
+            location_resolver_mock.call_args.args,
+            ("in PVR Phoenix", ["movies"], ActiveFilters()),
+        )
+
+    @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_sport_catalog_inquiry")
+    @patch("apps.agents.langchain_tools.invoke_movie_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
+    @patch("apps.agents.langchain_tools.invoke_location_resolver")
+    @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    def test_resolve_turn_filters_collects_clear_fields_from_location_and_temporal_resolvers(
+        self,
+        event_type_resolver_mock,
+        location_resolver_mock,
+        temporal_resolver_mock,
+        movie_filter_resolver_mock,
+        sport_catalog_inquiry_mock,
+        sport_filter_resolver_mock,
+    ):
+        current_filters = ActiveFilters(
+            event_types=["sports"],
+            cities=["Mumbai"],
+            event_dates=["2026-04-12"],
+            sport_types=["Cricket"],
+        )
+        event_type_resolver_mock.return_value = FilterResolution(status="no_input")
+        location_resolver_mock.return_value = FilterResolution(
+            status="resolved",
+            clear_fields=["cities"],
+        )
+        temporal_resolver_mock.return_value = FilterResolution(
+            status="resolved",
+            clear_fields=["event_dates"],
+            active_filters_partial=ActiveFilters(date_from="2026-04-07", date_to="2026-04-12"),
+        )
+        movie_filter_resolver_mock.return_value = FilterResolution(status="no_input")
+        sport_catalog_inquiry_mock.return_value = CatalogInquiry(status="no_input")
+        sport_filter_resolver_mock.return_value = FilterResolution(status="no_input")
+
+        result = resolve_turn_filters(
+            user_message="remove the mumbai filter and show matches this week",
+            current_filters=current_filters,
+            reference_date="2026-04-09",
+        )
+
+        self.assertEqual(result.clear_fields, ["cities", "event_dates"])
+        self.assertEqual(result.updates.date_from, "2026-04-07")
+        self.assertEqual(result.updates.date_to, "2026-04-12")
+
+    @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_sport_catalog_inquiry")
+    @patch("apps.agents.langchain_tools.invoke_movie_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
+    @patch("apps.agents.langchain_tools.invoke_location_resolver")
+    @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    def test_resolve_turn_filters_clears_current_city_for_outside_location_follow_up(
+        self,
+        event_type_resolver_mock,
+        location_resolver_mock,
+        temporal_resolver_mock,
+        movie_filter_resolver_mock,
+        sport_catalog_inquiry_mock,
+        sport_filter_resolver_mock,
+    ):
+        current_filters = ActiveFilters(
+            event_types=["sports"],
+            cities=["Mumbai"],
+            event_dates=["2026-04-12"],
+            sport_types=["Cricket"],
+        )
+        event_type_resolver_mock.return_value = FilterResolution(status="no_input")
+        location_resolver_mock.return_value = FilterResolution(status="no_input")
+        temporal_resolver_mock.return_value = FilterResolution(status="no_input")
+        movie_filter_resolver_mock.return_value = FilterResolution(status="no_input")
+        sport_catalog_inquiry_mock.return_value = CatalogInquiry(status="no_input")
+        sport_filter_resolver_mock.return_value = FilterResolution(status="no_input")
+
+        result = resolve_turn_filters(
+            user_message="what matches are there on sunday that are outside mumbai?",
+            current_filters=current_filters,
+            reference_date="2026-04-09",
+        )
+
+        self.assertEqual(result.clear_fields, ["cities"])
+
+    @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_sport_catalog_inquiry")
+    @patch("apps.agents.langchain_tools.invoke_movie_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
+    @patch("apps.agents.langchain_tools.invoke_location_resolver")
+    @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    def test_resolve_turn_filters_does_not_run_sport_catalog_inquiry_for_temporal_follow_up(
+        self,
+        event_type_resolver_mock,
+        location_resolver_mock,
+        temporal_resolver_mock,
+        movie_filter_resolver_mock,
+        sport_catalog_inquiry_mock,
+        sport_filter_resolver_mock,
+    ):
+        current_filters = ActiveFilters(
+            event_types=["sports"],
+            event_dates=["2026-04-12"],
+            sport_types=["Cricket"],
+        )
+        event_type_resolver_mock.return_value = FilterResolution(status="no_input")
+        location_resolver_mock.return_value = FilterResolution(status="no_input")
+        temporal_resolver_mock.return_value = FilterResolution(
+            status="resolved",
+            clear_fields=["event_dates"],
+            active_filters_partial=ActiveFilters(date_from="2026-04-06", date_to="2026-04-11"),
+        )
+        movie_filter_resolver_mock.return_value = FilterResolution(status="no_input")
+        sport_filter_resolver_mock.return_value = FilterResolution(status="no_input")
+
+        result = resolve_turn_filters(
+            user_message="not on sunday but this week?",
+            current_filters=current_filters,
+            reference_date="2026-04-09",
+        )
+
+        sport_catalog_inquiry_mock.assert_not_called()
+        self.assertEqual(result.clear_fields, ["event_dates"])
+        self.assertEqual(result.updates.date_from, "2026-04-06")
+        self.assertEqual(result.updates.date_to, "2026-04-11")
+        self.assertEqual(result.updates.sport_types, [])
+
+    def test_sanitize_temporal_resolution_clears_conflicting_temporal_mode_fields(self):
+        from apps.agents.langchain_tools import _sanitize_temporal_resolution
+
+        resolution = FilterResolution(
+            status="resolved",
+            active_filters_partial=ActiveFilters(
+                event_dates=["2026-04-12"],
+                date_from="2026-04-07",
+                date_to="2026-04-12",
+            ),
+        )
+
+        result = _sanitize_temporal_resolution(resolution)
+
+        self.assertEqual(result.active_filters_partial.event_dates, ["2026-04-12"])
+        self.assertIsNone(result.active_filters_partial.date_from)
+        self.assertIsNone(result.active_filters_partial.date_to)
+        self.assertEqual(result.clear_fields, ["date_from", "date_to"])
 
     @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
     @patch("apps.agents.langchain_tools.invoke_sport_catalog_inquiry")

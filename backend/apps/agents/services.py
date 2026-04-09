@@ -69,6 +69,7 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
         current_filters=current_filters,
         updates=turn_resolution.updates,
     )
+    filters_to_clear = sorted(set([*filters_to_clear, *turn_resolution.clear_fields]))
 
     merged_filters = _merge_filter_state(
         current_filters=current_filters,
