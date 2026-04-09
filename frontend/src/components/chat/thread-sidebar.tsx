@@ -33,7 +33,7 @@ export function ThreadSidebar({
                 <Ticket className="size-5" />
               </div>
               <div>
-                <CardTitle>Attend</CardTitle>
+                <CardTitle>EventsAI</CardTitle>
                 <CardDescription>Chat-first event discovery.</CardDescription>
               </div>
             </div>
@@ -76,7 +76,7 @@ export function ThreadSidebar({
           {!isLoading && threads.length === 0 ? (
             <Card className="border-dashed bg-white/60">
               <CardContent className="py-8 text-sm text-muted-foreground">
-                Start a thread and tell Attend what you want to watch.
+                Start a thread and tell EventsAI what you want to watch.
               </CardContent>
             </Card>
           ) : null}

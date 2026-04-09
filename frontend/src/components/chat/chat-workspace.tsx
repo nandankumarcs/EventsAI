@@ -129,7 +129,7 @@ export function ChatWorkspace({
                 </div>
                 <div className="space-y-2">
                   <h2 className="font-display text-2xl text-foreground">
-                    Tell Attend what you are in the mood for
+                    Tell EventsAI what you are in the mood for
                   </h2>
                   <p className="max-w-lg text-sm leading-7 text-muted-foreground">
                     Try something like “I want to watch a cricket match this Sunday in
@@ -243,7 +243,7 @@ function MessageBlock({
 
   return (
     <div className={`flex ${isAssistant ? 'justify-start' : 'justify-end'}`}>
-      <div className="max-w-3xl space-y-3">
+      <div className="max-w-full space-y-3 sm:max-w-3xl">
         <div
           className={`rounded-[24px] px-4 py-3 shadow-sm ${
             isAssistant
@@ -266,16 +266,18 @@ function MessageBlock({
         </div>
 
         {isAssistant && allResults.length > 0 ? (
-          <div className="grid gap-3 md:grid-cols-2">
-            {allResults.map((result) => (
-              <ResultCard
-                key={result.listing_code}
-                result={result}
-                disabled={threadStatus === 'booked'}
-                isBooking={bookingListingCode === result.listing_code}
-                onBook={onBook}
-              />
-            ))}
+          <div className="result-lane-mask max-w-full overflow-hidden">
+            <div className="scrollbar-none flex snap-x snap-mandatory gap-3 overflow-x-auto px-1 pb-2">
+              {allResults.map((result) => (
+                <ResultCard
+                  key={result.listing_code}
+                  result={result}
+                  disabled={threadStatus === 'booked'}
+                  isBooking={bookingListingCode === result.listing_code}
+                  onBook={onBook}
+                />
+              ))}
+            </div>
           </div>
         ) : null}
       </div>
@@ -294,15 +296,12 @@ function ResultCard({ result, disabled, isBooking, onBook }: ResultCardProps) {
   const eventTypeLabel = result.sport_type ?? result.genres?.slice(0, 2).join(', ') ?? 'Event'
 
   return (
-    <div className="rounded-[24px] border border-border/70 bg-white/86 p-4 shadow-sm">
-      <div className="space-y-3">
-        <div className="space-y-1.5">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h3 className="text-base font-semibold text-foreground">{result.title}</h3>
-              <p className="mt-1 text-sm text-muted-foreground">{eventTypeLabel}</p>
-            </div>
-            <span className="text-xs font-medium text-muted-foreground">{result.listing_code}</span>
+    <div className="snap-start w-[272px] min-w-[272px] rounded-[24px] border border-border/70 bg-white/86 p-3.5 shadow-sm sm:w-[286px] sm:min-w-[286px]">
+      <div className="space-y-2.5">
+        <div className="space-y-1">
+          <div>
+            <h3 className="text-[1.05rem] font-semibold leading-8 text-foreground">{result.title}</h3>
+            <p className="mt-1 text-sm text-muted-foreground">{eventTypeLabel}</p>
           </div>
         </div>
 
