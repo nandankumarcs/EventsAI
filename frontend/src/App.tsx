@@ -279,8 +279,8 @@ function App() {
   }
 
   return (
-    <div className="mx-auto flex h-screen w-full max-w-[1500px] flex-col overflow-hidden px-4 py-4 sm:px-6 lg:px-8">
-      <div className="grid h-full min-h-0 flex-1 gap-4 lg:grid-cols-[320px_minmax(0,1fr)] xl:grid-cols-[320px_minmax(0,1fr)_300px]">
+    <div className="flex h-screen w-full flex-col overflow-hidden bg-background">
+      <div className="grid h-full min-h-0 flex-1 lg:grid-cols-[280px_minmax(0,1fr)] xl:grid-cols-[280px_minmax(0,1fr)_300px]">
         <ThreadSidebar
           threads={threads}
           selectedThreadId={selectedThreadId}

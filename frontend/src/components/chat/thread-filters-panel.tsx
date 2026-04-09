@@ -1,7 +1,6 @@
 import { Eye } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import type { ThreadDetail } from '@/lib/api'
 
 type ThreadFiltersPanelProps = {
@@ -13,61 +12,59 @@ export function ThreadFiltersPanel({ thread }: ThreadFiltersPanelProps) {
   const hasFilters = filterEntries.length > 0
 
   return (
-    <aside className="hidden h-full min-h-0 xl:block">
-      <div className="h-full min-h-0 space-y-4">
-        <Card className="border-white/80 bg-white/88">
-          <CardHeader className="space-y-2">
-            <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-primary">
-              <Eye className="size-4" />
-              Live thread filters
-            </div>
-            <div>
-              <CardTitle className="text-xl">Realtime state</CardTitle>
-              <CardDescription>Saved filters for the active thread.</CardDescription>
-            </div>
-          </CardHeader>
+    <aside className="hidden h-full min-h-0 w-80 shrink-0 border-l border-border/70 bg-background/50 xl:block">
+      <div className="flex h-full flex-col">
+        <div className="sticky top-0 z-10 border-b border-border/70 bg-background/95 px-5 py-5 backdrop-blur">
+          <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-primary">
+            <Eye className="size-4" />
+            Live filters
+          </div>
+          <div>
+            <h2 className="text-lg font-semibold">Realtime state</h2>
+            <p className="text-sm text-muted-foreground">Saved filters for the active thread.</p>
+          </div>
+        </div>
 
-          <CardContent className="max-h-[calc(100vh-5rem)] space-y-3 overflow-y-auto">
-            {thread ? (
-              <div className="rounded-[22px] border border-border/70 bg-background/75 p-4">
-                <p className="text-sm font-semibold text-foreground">{thread.title}</p>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  {thread.status === 'booked' ? 'Booking saved' : 'Active search state'}
-                </p>
-              </div>
-            ) : (
-              <div className="rounded-[22px] border border-dashed border-border bg-background/60 p-4 text-sm text-muted-foreground">
-                Select a thread to inspect the saved filter state in realtime.
-              </div>
-            )}
+        <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          {thread ? (
+            <div className="rounded-[16px] border border-border/70 bg-background p-4">
+              <p className="text-sm font-semibold text-foreground">{thread.title}</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {thread.status === 'booked' ? 'Booking saved' : 'Active search state'}
+              </p>
+            </div>
+          ) : (
+            <div className="rounded-[16px] border border-dashed border-border p-4 text-sm text-muted-foreground">
+              Select a thread to inspect the saved filter state in realtime.
+            </div>
+          )}
 
-            {hasFilters ? (
-              <div className="space-y-2">
-                {filterEntries.map(({ key, label, values }) => (
-                  <div
-                    key={key}
-                    className="rounded-[20px] border border-border/70 bg-background/70 p-3.5"
-                  >
-                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                      {label}
-                    </p>
-                    <div className="mt-2.5 flex flex-wrap gap-2">
-                      {values.map((item) => (
-                        <Badge key={`${key}-${item}`} variant="default">
-                          {item}
-                        </Badge>
-                      ))}
-                    </div>
+          {hasFilters ? (
+            <div className="space-y-2">
+              {filterEntries.map(({ key, label, values }) => (
+                <div
+                  key={key}
+                  className="rounded-[16px] border border-border/70 bg-background p-3.5"
+                >
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                    {label}
+                  </p>
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    {values.map((item) => (
+                      <Badge key={`${key}-${item}`} variant="default" className="font-medium bg-muted/60 text-foreground">
+                        {item}
+                      </Badge>
+                    ))}
                   </div>
-                ))}
-              </div>
-            ) : thread ? (
-              <div className="rounded-[22px] border border-dashed border-border bg-background/60 p-4 text-sm text-muted-foreground">
-                No filters have been accumulated in this thread yet.
-              </div>
-            ) : null}
-          </CardContent>
-        </Card>
+                </div>
+              ))}
+            </div>
+          ) : thread ? (
+            <div className="rounded-[16px] border border-dashed border-border p-4 text-sm text-muted-foreground">
+              No filters have been accumulated in this thread yet.
+            </div>
+          ) : null}
+        </div>
       </div>
     </aside>
   )

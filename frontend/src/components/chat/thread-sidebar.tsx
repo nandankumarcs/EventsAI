@@ -1,8 +1,6 @@
-import { Clock3, Plus, Ticket } from 'lucide-react'
+import { Plus } from 'lucide-react'
 
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import type { ThreadSummary } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
@@ -24,109 +22,49 @@ export function ThreadSidebar({
   onSelectThread,
 }: ThreadSidebarProps) {
   return (
-    <aside className="flex h-full min-h-0 w-full max-w-sm flex-col gap-5 overflow-hidden">
-      <Card className="border-white/80 bg-white/88">
-        <CardHeader className="gap-4">
-          <div className="flex items-start justify-between gap-4">
-            <div className="space-y-2">
-              <div className="inline-flex size-11 items-center justify-center rounded-2xl bg-primary/12 text-primary">
-                <Ticket className="size-5" />
-              </div>
-              <div>
-                <CardTitle>EventsAI</CardTitle>
-                <CardDescription>Chat-first event discovery.</CardDescription>
-              </div>
-            </div>
-            <Button
-              type="button"
-              size="icon"
-              variant="outline"
-              aria-label="Create a new chat thread"
-              disabled={isCreating}
-              onClick={onCreateThread}
-            >
-              <Plus className="size-4" />
-            </Button>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-3 text-sm text-muted-foreground">
-          <div className="flex flex-wrap gap-2">
-            <Badge variant="default">{threads.length} threads</Badge>
-            <Badge variant="success">
-              {threads.filter((thread) => thread.status === 'booked').length} booked
-            </Badge>
-          </div>
-        </CardContent>
-      </Card>
+    <aside className="flex h-full min-h-0 w-full flex-col bg-muted/30 border-r border-border/50 overflow-hidden">
+      <div className="p-3">
+        <Button
+          type="button"
+          variant="outline"
+          className="w-full justify-start gap-2 bg-background shadow-xs hover:bg-accent"
+          disabled={isCreating}
+          onClick={onCreateThread}
+        >
+          <Plus className="size-4" />
+          {isCreating ? 'Opening...' : 'New chat'}
+        </Button>
+      </div>
 
-      <div className="flex min-h-0 flex-1 flex-col space-y-3 overflow-hidden">
-        <p className="px-1 text-xs font-semibold uppercase tracking-[0.24em] text-muted-foreground">
-          Recent threads
-        </p>
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div className="px-3 py-2 text-xs font-semibold text-muted-foreground">
+          Recents
+        </div>
 
-        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
+        <div className="min-h-0 flex-1 space-y-[2px] overflow-y-auto px-2 pb-4">
           {isLoading ? (
-            <Card className="border-dashed bg-white/60">
-              <CardContent className="py-8 text-sm text-muted-foreground">
-                Loading saved threads...
-              </CardContent>
-            </Card>
+            <div className="p-3 text-sm text-muted-foreground">Loading...</div>
           ) : null}
 
           {!isLoading && threads.length === 0 ? (
-            <Card className="border-dashed bg-white/60">
-              <CardContent className="py-8 text-sm text-muted-foreground">
-                Start a thread and tell EventsAI what you want to watch.
-              </CardContent>
-            </Card>
+            <div className="p-3 text-sm text-muted-foreground">No recent chats.</div>
           ) : null}
 
           {threads.map((thread) => {
             const isActive = thread.id === selectedThreadId
-            const filters = Object.entries(thread.active_filters ?? {}).slice(0, 2)
-
             return (
               <button
                 key={thread.id}
                 type="button"
                 className={cn(
-                  'block w-full rounded-[24px] border border-border/70 bg-white/76 p-4 text-left shadow-sm transition hover:border-primary/40 hover:bg-white',
-                  isActive && 'border-primary/30 bg-white shadow-md',
+                  'block w-full rounded-lg px-3 py-2.5 text-left text-sm transition',
+                  isActive
+                    ? 'bg-accent/80 font-medium text-accent-foreground'
+                    : 'text-muted-foreground hover:bg-accent/40 hover:text-foreground',
                 )}
                 onClick={() => onSelectThread(thread.id)}
               >
-                <div className="space-y-3">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="space-y-1.5">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <h3 className="text-sm font-semibold text-foreground">{thread.title}</h3>
-                        {thread.status === 'booked' ? (
-                          <Badge variant="success">Booked</Badge>
-                        ) : null}
-                      </div>
-                      <p className="line-clamp-1 text-sm text-muted-foreground">
-                        {thread.last_message_preview || 'No messages yet.'}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <Clock3 className="size-4" />
-                      <span>{formatRelativeDate(thread.last_activity_at)}</span>
-                    </div>
-                  </div>
-
-                  {filters.length > 0 ? (
-                    <div className="flex flex-wrap gap-2">
-                      {filters.map(([key, value]) => (
-                        <span
-                          key={key}
-                          className="rounded-full bg-accent/70 px-2.5 py-1 text-xs font-medium text-accent-foreground"
-                        >
-                          {formatFilterPreview(key, value)}
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
-                </div>
+                <div className="truncate">{thread.title}</div>
               </button>
             )
           })}
@@ -136,30 +74,4 @@ export function ThreadSidebar({
   )
 }
 
-function formatRelativeDate(value: string) {
-  const date = new Date(value)
-  return new Intl.DateTimeFormat('en-IN', {
-    day: 'numeric',
-    month: 'short',
-  }).format(date)
-}
 
-function formatFilterPreview(key: string, value: string[] | string) {
-  const values = Array.isArray(value) ? value.filter(Boolean) : [value].filter(Boolean)
-  if (values.length === 0) {
-    return formatFilterKey(key)
-  }
-
-  const label = formatFilterKey(key)
-  if (values.length === 1) {
-    return `${label}: ${values[0]}`
-  }
-
-  return `${label}: ${values[0]} +${values.length - 1}`
-}
-
-function formatFilterKey(value: string) {
-  return value
-    .replace(/_/g, ' ')
-    .replace(/\b\w/g, (character) => character.toUpperCase())
-}

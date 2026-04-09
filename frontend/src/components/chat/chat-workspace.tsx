@@ -1,8 +1,10 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import {
   Bot,
   CalendarDays,
+  ChevronLeft,
+  ChevronRight,
   CircleDashed,
   MapPin,
   Plus,
@@ -14,7 +16,6 @@ import {
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import type { HealthResponse, SearchResultItem, ThreadDetail, ThreadMessage } from '@/lib/api'
 
@@ -71,30 +72,27 @@ export function ChatWorkspace({
   }, [thread?.id, thread?.messages.length, loadingThread, sending])
 
   return (
-    <main className="flex h-full min-h-0 flex-1 flex-col gap-4 overflow-hidden">
-      <Card className="flex min-h-0 flex-1 flex-col border-white/80 bg-white/88">
-        <CardHeader className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div className="space-y-1.5">
-            <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-primary">
-              <Sparkles className="size-4" />
-              Event concierge
-            </div>
-            <CardTitle>{thread?.title ?? 'Start a new conversation'}</CardTitle>
-            <CardDescription>Every message updates this thread’s active search.</CardDescription>
-          </div>
+    <main className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background">
+      {/* Top Navigation */}
+      <header className="sticky top-0 z-10 flex items-center justify-between px-4 py-3 border-b border-border/70 bg-background/95 backdrop-blur">
+        <div className="flex items-center gap-2 font-semibold">
+          <Sparkles className="size-4 text-primary" />
+          <span>{thread?.title ?? 'New conversation'}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <Badge variant={backendOnline ? 'success' : 'warning'}>
+            {backendOnline ? 'Backend connected' : 'Backend offline'}
+          </Badge>
+          <Badge variant={health?.database.reachable ? 'success' : 'warning'}>
+            {health?.database.reachable ? 'Database ready' : 'Database pending'}
+          </Badge>
+          {thread?.status === 'booked' ? <Badge variant="success">Booking saved</Badge> : null}
+        </div>
+      </header>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge variant={backendOnline ? 'success' : 'warning'}>
-              {backendOnline ? 'Backend connected' : 'Backend offline'}
-            </Badge>
-            <Badge variant={health?.database.reachable ? 'success' : 'warning'}>
-              {health?.database.reachable ? 'Database ready' : 'Database pending'}
-            </Badge>
-            {thread?.status === 'booked' ? <Badge variant="success">Booking saved</Badge> : null}
-          </div>
-        </CardHeader>
-
-        <CardContent className="flex min-h-0 flex-1 flex-col space-y-4">
+      {/* Main scrolling area */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto" ref={historyRef}>
+        <div className="mx-auto w-full max-w-4xl px-4 py-6 md:py-10 space-y-6">
           {isBookedThread ? (
             <div className="flex flex-col gap-3 rounded-[22px] border border-emerald-500/20 bg-emerald-500/8 px-4 py-4 text-sm text-emerald-900 sm:flex-row sm:items-center sm:justify-between">
               <div className="space-y-1">
@@ -115,44 +113,42 @@ export function ChatWorkspace({
             </div>
           ) : null}
 
-          <section className="flex min-h-0 flex-1 flex-col rounded-[28px] border border-border/70 bg-background/82 p-4">
-            {loadingThread ? (
-              <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">
-                Loading conversation...
-              </div>
-            ) : null}
+          {loadingThread ? (
+            <div className="flex min-h-[50vh] items-center justify-center text-sm text-muted-foreground">
+              Loading conversation...
+            </div>
+          ) : null}
 
-            {!loadingThread && !thread ? (
-              <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 text-center">
-                <div className="rounded-full bg-primary/10 p-4 text-primary">
-                  <CircleDashed className="size-6" />
-                </div>
-                <div className="space-y-2">
-                  <h2 className="font-display text-2xl text-foreground">
-                    Tell EventsAI what you are in the mood for
-                  </h2>
-                  <p className="max-w-lg text-sm leading-7 text-muted-foreground">
-                    Try something like “I want to watch a cricket match this Sunday in
-                    Mumbai around 7pm” and keep refining the same thread.
-                  </p>
-                </div>
+          {!loadingThread && !thread ? (
+            <div className="flex min-h-[50vh] flex-col items-center justify-center gap-4 text-center">
+              <div className="rounded-full bg-primary/10 p-4 text-primary">
+                <CircleDashed className="size-6" />
               </div>
-            ) : null}
+              <div className="space-y-2">
+                <h2 className="font-display text-2xl text-foreground">
+                  Tell EventsAI what you are in the mood for
+                </h2>
+                <p className="max-w-lg text-sm leading-7 text-muted-foreground">
+                  Try something like “I want to watch a cricket match this Sunday in
+                  Mumbai around 7pm” and keep refining the same thread.
+                </p>
+              </div>
+            </div>
+          ) : null}
 
-            {!loadingThread && thread ? (
-              <div ref={historyRef} className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-1">
-                {thread.messages.map((message) => (
-                  <MessageBlock
-                    key={message.id}
-                    message={message}
-                    threadStatus={thread.status}
-                    bookingListingCode={bookingListingCode}
-                    onBook={onBook}
-                  />
-                ))}
-              </div>
-            ) : null}
-          </section>
+          {!loadingThread && thread ? (
+            <div className="flex flex-col gap-8 pb-4">
+              {thread.messages.map((message) => (
+                <MessageBlock
+                  key={message.id}
+                  message={message}
+                  threadStatus={thread.status}
+                  bookingListingCode={bookingListingCode}
+                  onBook={onBook}
+                />
+              ))}
+            </div>
+          ) : null}
 
           {healthError ? (
             <div className="flex flex-col gap-3 rounded-[22px] border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 sm:flex-row sm:items-center sm:justify-between">
@@ -173,13 +169,14 @@ export function ChatWorkspace({
               ) : null}
             </div>
           ) : null}
-        </CardContent>
-      </Card>
+        </div>
+      </div>
 
-      <Card className="border-white/80 bg-white/88">
-        <CardContent className="p-4">
+      {/* Input area */}
+      <div className="mt-auto bg-background px-4 pb-6 pt-2">
+        <div className="mx-auto w-full max-w-4xl">
           {isBookedThread ? (
-            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between px-2">
               <div className="space-y-1">
                 <p className="text-sm font-medium text-foreground">This thread is read-only now.</p>
                 <p className="text-sm text-muted-foreground">
@@ -198,10 +195,10 @@ export function ChatWorkspace({
             </div>
           ) : (
             <form
-              className="flex flex-col gap-3 md:flex-row"
+              className="relative flex items-center w-full rounded-[32px] border border-border/50 bg-muted/30 px-3 py-2 shadow-sm focus-within:ring-1 focus-within:border-border hover:border-border transition-all duration-300"
               onSubmit={(event) => {
                 event.preventDefault()
-                onSend()
+                if (draft.trim() && !sending) onSend()
               }}
             >
               <Input
@@ -209,17 +206,23 @@ export function ChatWorkspace({
                 name="message"
                 value={draft}
                 onChange={(event) => onDraftChange(event.target.value)}
-                placeholder="Try: I want sports in Mumbai this Sunday around 7 PM"
+                placeholder="Message EventsAI..."
                 disabled={sending}
+                className="flex-1 border-0 bg-transparent px-3 py-2 text-[15px] shadow-none focus-visible:ring-0 placeholder:text-muted-foreground/70"
               />
-              <Button className="md:min-w-40" type="submit" disabled={sending || !draft.trim()}>
-                <SendHorizontal className="size-4" />
-                {sending ? 'Sending...' : 'Send'}
+              <Button 
+                className="shrink-0 rounded-full h-9 w-9 p-0 ml-2 transition-transform duration-300 hover:scale-105 active:scale-95" 
+                type="submit" 
+                size="icon"
+                disabled={sending || !draft.trim()}
+              >
+                <SendHorizontal className="size-[18px]" />
+                <span className="sr-only">Send</span>
               </Button>
             </form>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </div>
     </main>
   )
 }
@@ -242,23 +245,23 @@ function MessageBlock({
   const allResults = Object.values(resultsByDomain).flatMap((domain) => domain.results)
 
   return (
-    <div className={`flex ${isAssistant ? 'justify-start' : 'justify-end'}`}>
-      <div className="max-w-full space-y-3 sm:max-w-3xl">
+    <div className={`flex w-full ${isAssistant ? 'justify-start' : 'justify-end'}`}>
+      <div className={`max-w-full space-y-3 ${isAssistant ? 'w-full' : 'sm:max-w-3xl'}`}>
         <div
-          className={`rounded-[24px] px-4 py-3 shadow-sm ${
+          className={`${
             isAssistant
-              ? 'border border-border/70 bg-card text-card-foreground'
-              : 'bg-primary text-primary-foreground'
+              ? 'bg-transparent text-foreground'
+              : 'rounded-3xl bg-muted/60 px-5 py-3.5 text-foreground shadow-none'
           }`}
         >
-          <div className="mb-2 flex items-center gap-2 text-xs uppercase tracking-[0.2em] opacity-80">
-            {isAssistant ? <Bot className="size-3.5" /> : <UserRound className="size-3.5" />}
-            <span>{message.role}</span>
+          <div className={`mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground ${isAssistant ? '' : 'hidden'}`}>
+            <Bot className="size-4" />
+            <span>Events AI</span>
           </div>
-          <p className="text-sm leading-6">{message.content}</p>
+          <p className="text-[15px] leading-relaxed whitespace-pre-wrap">{message.content}</p>
 
           {message.metadata.booking_reference ? (
-            <div className="mt-3 inline-flex items-center gap-2 rounded-full bg-emerald-500/12 px-3 py-1.5 text-xs font-semibold text-emerald-700">
+            <div className="mt-3 inline-flex items-center gap-2 rounded-full bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-800">
               <TicketCheck className="size-3.5" />
               Ref {message.metadata.booking_reference}
             </div>
@@ -266,24 +269,94 @@ function MessageBlock({
         </div>
 
         {isAssistant && allResults.length > 0 ? (
-          <div className="result-lane-mask max-w-full overflow-hidden">
-            <div className="scrollbar-none flex snap-x snap-mandatory gap-3 overflow-x-auto px-1 pb-2">
-              {allResults.map((result) => (
-                <ResultCard
-                  key={result.listing_code}
-                  result={result}
-                  disabled={threadStatus === 'booked'}
-                  isBooking={bookingListingCode === result.listing_code}
-                  onBook={onBook}
-                />
-              ))}
-            </div>
-          </div>
+          <ResultCarousel
+            results={allResults}
+            threadStatus={threadStatus}
+            bookingListingCode={bookingListingCode}
+            onBook={onBook}
+          />
         ) : null}
       </div>
     </div>
   )
 }
+
+function ResultCarousel({
+  results,
+  threadStatus,
+  bookingListingCode,
+  onBook,
+}: {
+  results: SearchResultItem[]
+  threadStatus?: string
+  bookingListingCode: string | null
+  onBook: (listingCode: string) => void
+}) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [canScrollLeft, setCanScrollLeft] = useState(false)
+  const [canScrollRight, setCanScrollRight] = useState(false)
+
+  const checkScroll = () => {
+    if (containerRef.current) {
+      const { scrollLeft, scrollWidth, clientWidth } = containerRef.current
+      setCanScrollLeft(scrollLeft > 5)
+      setCanScrollRight(Math.ceil(scrollLeft + clientWidth + 5) < scrollWidth)
+    }
+  }
+
+  useEffect(() => {
+    checkScroll()
+    window.addEventListener('resize', checkScroll)
+    return () => window.removeEventListener('resize', checkScroll)
+  }, [results])
+
+  const scrollLeft = () => {
+    containerRef.current?.scrollBy({ left: -320, behavior: 'smooth' })
+  }
+
+  const scrollRight = () => {
+    containerRef.current?.scrollBy({ left: 320, behavior: 'smooth' })
+  }
+
+  return (
+    <div className="group relative max-w-full">
+      {canScrollLeft && (
+        <button
+          onClick={scrollLeft}
+          className="absolute -left-3 top-1/2 z-10 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-full border border-border/80 bg-background text-foreground shadow-md transition-all hover:scale-110 hover:shadow-lg active:scale-95 focus:outline-none"
+        >
+          <ChevronLeft className="h-[18px] w-[18px]" />
+        </button>
+      )}
+
+      <div
+        ref={containerRef}
+        onScroll={checkScroll}
+        className="scrollbar-none flex snap-x snap-mandatory gap-3 overflow-x-auto px-1 pb-2"
+      >
+        {results.map((result) => (
+          <ResultCard
+            key={result.listing_code}
+            result={result}
+            disabled={threadStatus === 'booked'}
+            isBooking={bookingListingCode === result.listing_code}
+            onBook={onBook}
+          />
+        ))}
+      </div>
+
+      {canScrollRight && (
+        <button
+          onClick={scrollRight}
+          className="absolute -right-3 top-1/2 z-10 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-full border border-border/80 bg-background text-foreground shadow-md transition-all hover:scale-110 hover:shadow-lg active:scale-95 focus:outline-none"
+        >
+          <ChevronRight className="h-[18px] w-[18px]" />
+        </button>
+      )}
+    </div>
+  )
+}
+
 
 type ResultCardProps = {
   result: SearchResultItem
