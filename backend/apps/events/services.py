@@ -63,6 +63,34 @@ def search_sport_events(
     return _build_result(queryset, filters, limit, offset, _serialize_sport_event)
 
 
+def diversify_sport_results(results: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    if limit <= 0 or len(results) <= 1:
+        return results[:limit]
+
+    selected: list[dict[str, Any]] = []
+    used_listing_codes: set[str] = set()
+    seen_sport_types: set[str] = set()
+
+    for item in results:
+        sport_type = item.get("sport_type")
+        if not sport_type or sport_type in seen_sport_types:
+            continue
+        selected.append(item)
+        used_listing_codes.add(item["listing_code"])
+        seen_sport_types.add(sport_type)
+        if len(selected) == limit:
+            return selected
+
+    for item in results:
+        if item["listing_code"] in used_listing_codes:
+            continue
+        selected.append(item)
+        if len(selected) == limit:
+            break
+
+    return selected[:limit]
+
+
 def _build_result(
     queryset: QuerySet,
     filters: dict[str, Any],

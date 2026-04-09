@@ -280,7 +280,7 @@ function App() {
 
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-[1500px] flex-col px-4 py-4 sm:px-6 lg:px-8">
-      <div className="grid flex-1 gap-6 lg:grid-cols-[320px_minmax(0,1fr)] xl:grid-cols-[320px_minmax(0,1fr)_320px]">
+      <div className="grid flex-1 gap-4 lg:grid-cols-[320px_minmax(0,1fr)] xl:grid-cols-[320px_minmax(0,1fr)_300px]">
         <ThreadSidebar
           threads={threads}
           selectedThreadId={selectedThreadId}

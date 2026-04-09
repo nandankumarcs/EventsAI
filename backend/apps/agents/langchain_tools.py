@@ -12,7 +12,7 @@ from langchain.agents.structured_output import ToolStrategy
 from langchain.tools import tool
 from langchain_openai import ChatOpenAI
 
-from apps.agents.schemas import ActiveFilters, FilterResolution
+from apps.agents.schemas import ActiveFilters, CatalogInquiry, FilterResolution
 from apps.events.filter_tools import (
     get_all_event_types,
     get_available_movie_cast_members,
@@ -381,6 +381,29 @@ def _build_sport_filter_agent():
     )
 
 
+@lru_cache(maxsize=1)
+def _build_sport_catalog_agent():
+    @tool("get_sport_types")
+    def sport_types() -> list[str]:
+        """Return sport types currently available."""
+        return get_available_sport_types()
+
+    return create_agent(
+        model=get_chat_model(resolver=True),
+        tools=[sport_types],
+        response_format=ToolStrategy(CatalogInquiry),
+        system_prompt=(
+            "You detect when the user is asking an informational catalog question about available sports.\n"
+            "The user message is provided as JSON with user_message.\n"
+            "You must call get_sport_types before answering.\n"
+            "Return status answer only when the user is asking what sports are available, what other sports exist, or asking for alternatives/options without selecting one.\n"
+            "When you return answer, set inquiry_key to 'sport_types' and include the canonical sport type values from the tool in listed_values.\n"
+            "Do not treat that question as a filter selection.\n"
+            "If the user is choosing or changing a sport filter, return no_input."
+        ),
+    )
+
+
 def invoke_event_type_resolver(user_message: str) -> FilterResolution:
     return _invoke_filter_resolution_agent(
         agent=_build_event_type_agent(),
@@ -483,6 +506,27 @@ def invoke_sport_filter_resolver(user_message: str) -> FilterResolution:
     )
 
 
+def invoke_sport_catalog_inquiry(user_message: str) -> CatalogInquiry:
+    try:
+        response = _build_sport_catalog_agent().invoke(
+            {"messages": [{"role": "user", "content": json.dumps({"user_message": user_message})}]}
+        )
+    except Exception as exc:
+        logger.warning("resolve_sport_catalog_inquiry failed: %s", exc)
+        return CatalogInquiry(status="no_input")
+
+    structured_response = response.get("structured_response")
+    if isinstance(structured_response, CatalogInquiry):
+        return structured_response
+    if structured_response is not None:
+        try:
+            return CatalogInquiry.model_validate(structured_response)
+        except Exception as exc:
+            logger.warning("resolve_sport_catalog_inquiry returned invalid structured response: %s", exc)
+
+    return CatalogInquiry(status="no_input")
+
+
 def resolve_turn_filters(
     *,
     user_message: str,
@@ -493,6 +537,7 @@ def resolve_turn_filters(
     updates = ActiveFilters()
     issues: list[ResolutionIssue] = []
     current_domains = current_filters.event_types
+    domain_switched = False
 
     event_type_resolution = invoke_event_type_resolver(user_message)
     trace.append("resolve_event_type")
@@ -501,6 +546,7 @@ def resolve_turn_filters(
         current_domains=current_domains,
     ):
         updates = _merge_active_filters(updates, _partial_from_resolution(event_type_resolution))
+        domain_switched = bool(updates.event_types and updates.event_types != current_domains)
         _append_resolution_issue(
             issues=issues,
             resolution=event_type_resolution,
@@ -536,6 +582,16 @@ def resolve_turn_filters(
         )
 
     if "sports" in effective_domains:
+        if not domain_switched:
+            sport_catalog_inquiry = invoke_sport_catalog_inquiry(user_message)
+            if sport_catalog_inquiry.status == "answer":
+                trace.append("resolve_sport_catalog_inquiry")
+                updates = _merge_active_filters(
+                    updates,
+                    ActiveFilters(sport_types=sport_catalog_inquiry.listed_values),
+                )
+                return TurnResolution(updates=updates, tool_trace=trace, issues=issues)
+
         sport_resolution = invoke_sport_filter_resolver(user_message)
         trace.append("resolve_sport_filters")
         updates = _merge_active_filters(updates, _partial_from_resolution(sport_resolution))

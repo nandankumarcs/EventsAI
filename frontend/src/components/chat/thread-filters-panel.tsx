@@ -1,4 +1,4 @@
-import { Eye, Sparkles } from 'lucide-react'
+import { Eye } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -16,17 +16,14 @@ export function ThreadFiltersPanel({ thread }: ThreadFiltersPanelProps) {
     <aside className="hidden xl:block">
       <div className="sticky top-4 space-y-4">
         <Card className="border-white/80 bg-white/88">
-          <CardHeader className="space-y-3">
+          <CardHeader className="space-y-2">
             <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-primary">
               <Eye className="size-4" />
               Live thread filters
             </div>
-            <div className="space-y-2">
+            <div>
               <CardTitle className="text-xl">Realtime state</CardTitle>
-              <CardDescription>
-                These are the filters currently saved for this thread. They refresh as the
-                conversation resolves new preferences.
-              </CardDescription>
+              <CardDescription>Saved filters for the active thread.</CardDescription>
             </div>
           </CardHeader>
 
@@ -35,9 +32,7 @@ export function ThreadFiltersPanel({ thread }: ThreadFiltersPanelProps) {
               <div className="rounded-[22px] border border-border/70 bg-background/75 p-4">
                 <p className="text-sm font-semibold text-foreground">{thread.title}</p>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  {thread.status === 'booked'
-                    ? 'This thread is locked after booking confirmation.'
-                    : 'Watching the active filter state update turn by turn.'}
+                  {thread.status === 'booked' ? 'Booking saved' : 'Active search state'}
                 </p>
               </div>
             ) : (
@@ -47,16 +42,16 @@ export function ThreadFiltersPanel({ thread }: ThreadFiltersPanelProps) {
             )}
 
             {hasFilters ? (
-              <div className="space-y-3">
+              <div className="space-y-2">
                 {filterEntries.map(({ key, label, values }) => (
                   <div
                     key={key}
-                    className="rounded-[22px] border border-border/70 bg-background/70 p-4"
+                    className="rounded-[20px] border border-border/70 bg-background/70 p-3.5"
                   >
                     <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                       {label}
                     </p>
-                    <div className="mt-3 flex flex-wrap gap-2">
+                    <div className="mt-2.5 flex flex-wrap gap-2">
                       {values.map((item) => (
                         <Badge key={`${key}-${item}`} variant="default">
                           {item}
@@ -71,16 +66,6 @@ export function ThreadFiltersPanel({ thread }: ThreadFiltersPanelProps) {
                 No filters have been accumulated in this thread yet.
               </div>
             ) : null}
-          </CardContent>
-        </Card>
-
-        <Card className="border-white/80 bg-white/82">
-          <CardContent className="flex gap-3 p-4 text-sm text-muted-foreground">
-            <Sparkles className="mt-0.5 size-4 shrink-0 text-primary" />
-            <p>
-              Use this panel during testing to confirm that every follow-up adds, replaces,
-              or clears only the intended filters.
-            </p>
           </CardContent>
         </Card>
       </div>

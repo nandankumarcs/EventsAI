@@ -34,9 +34,7 @@ export function ThreadSidebar({
               </div>
               <div>
                 <CardTitle>Attend</CardTitle>
-                <CardDescription>
-                  Stateful event discovery through chat, not filters.
-                </CardDescription>
+                <CardDescription>Chat-first event discovery.</CardDescription>
               </div>
             </div>
             <Button
@@ -52,10 +50,6 @@ export function ThreadSidebar({
           </div>
         </CardHeader>
         <CardContent className="space-y-3 text-sm text-muted-foreground">
-          <p>
-            Each thread carries its own saved filter state, so follow-ups like
-            “actually Mumbai” update the same search journey.
-          </p>
           <div className="flex flex-wrap gap-2">
             <Badge variant="default">{threads.length} threads</Badge>
             <Badge variant="success">
@@ -101,34 +95,37 @@ export function ThreadSidebar({
                 )}
                 onClick={() => onSelectThread(thread.id)}
               >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="space-y-2">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h3 className="text-sm font-semibold text-foreground">{thread.title}</h3>
-                      {thread.status === 'booked' ? (
-                        <Badge variant="success">Booked</Badge>
-                      ) : null}
-                    </div>
-                    <p className="line-clamp-2 text-sm leading-6 text-muted-foreground">
-                      {thread.last_message_preview || 'No messages yet.'}
-                    </p>
-                    {filters.length > 0 ? (
-                      <div className="flex flex-wrap gap-2">
-                        {filters.map(([key, value]) => (
-                          <span
-                            key={key}
-                            className="rounded-full bg-accent/70 px-3 py-1 text-xs font-medium text-accent-foreground"
-                          >
-                            {Array.isArray(value) ? value.join(', ') : value}
-                          </span>
-                        ))}
+                <div className="space-y-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="space-y-1.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="text-sm font-semibold text-foreground">{thread.title}</h3>
+                        {thread.status === 'booked' ? (
+                          <Badge variant="success">Booked</Badge>
+                        ) : null}
                       </div>
-                    ) : null}
+                      <p className="line-clamp-1 text-sm text-muted-foreground">
+                        {thread.last_message_preview || 'No messages yet.'}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                      <Clock3 className="size-4" />
+                      <span>{formatRelativeDate(thread.last_activity_at)}</span>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                    <Clock3 className="size-4" />
-                    <span>{formatRelativeDate(thread.last_activity_at)}</span>
-                  </div>
+
+                  {filters.length > 0 ? (
+                    <div className="flex flex-wrap gap-2">
+                      {filters.map(([key, value]) => (
+                        <span
+                          key={key}
+                          className="rounded-full bg-accent/70 px-2.5 py-1 text-xs font-medium text-accent-foreground"
+                        >
+                          {formatFilterPreview(key, value)}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
               </button>
             )
@@ -145,4 +142,24 @@ function formatRelativeDate(value: string) {
     day: 'numeric',
     month: 'short',
   }).format(date)
+}
+
+function formatFilterPreview(key: string, value: string[] | string) {
+  const values = Array.isArray(value) ? value.filter(Boolean) : [value].filter(Boolean)
+  if (values.length === 0) {
+    return formatFilterKey(key)
+  }
+
+  const label = formatFilterKey(key)
+  if (values.length === 1) {
+    return `${label}: ${values[0]}`
+  }
+
+  return `${label}: ${values[0]} +${values.length - 1}`
+}
+
+function formatFilterKey(value: string) {
+  return value
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (character) => character.toUpperCase())
 }

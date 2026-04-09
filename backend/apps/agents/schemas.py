@@ -48,6 +48,13 @@ class FilterResolution(BaseModel):
     candidates: list[str] = Field(default_factory=list)
 
 
+class CatalogInquiry(BaseModel):
+    status: Literal["answer", "no_input"] = "no_input"
+    inquiry_key: str = ""
+    message: str = ""
+    listed_values: list[str] = Field(default_factory=list)
+
+
 class SearchSummary(BaseModel):
     domain: Literal["movies", "sports"]
     count: int

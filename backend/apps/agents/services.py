@@ -8,7 +8,7 @@ from django.utils import timezone
 from apps.agents.langchain_tools import ResolutionIssue, resolve_turn_filters
 from apps.agents.schemas import ActiveFilters
 from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
-from apps.events.services import search_movie_events, search_sport_events
+from apps.events.services import diversify_sport_results, search_movie_events, search_sport_events
 
 MOVIE_FILTER_KEYS = {
     "titles",
@@ -37,6 +37,7 @@ SPORT_FILTER_KEYS = {
 }
 
 SHARED_SWITCH_CLEAR_KEYS = {
+    "languages",
     "venue_names",
 }
 
@@ -77,9 +78,9 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
 
     blocking_issue = _get_blocking_issue(turn_resolution.issues)
     if blocking_issue is not None:
-        search_domains: list[str] = []
-        results_by_domain: dict[str, dict[str, Any]] = {}
-        result_listing_codes: list[str] = []
+        search_domains = []
+        results_by_domain = {}
+        result_listing_codes = []
         assistant_content, needs_clarification, clarification_question = _build_issue_reply(
             issue=blocking_issue,
         )
@@ -249,7 +250,12 @@ def _fetch_results_by_domain(filters: ActiveFilters, domains: list[str]) -> dict
     if "movies" in domains:
         results["movies"] = search_movie_events(payload, limit=5, offset=0).to_dict()
     if "sports" in domains:
-        results["sports"] = search_sport_events(payload, limit=5, offset=0).to_dict()
+        sport_limit = 20 if len(filters.sport_types) > 1 else 5
+        sport_results = search_sport_events(payload, limit=sport_limit, offset=0).to_dict()
+        if len(filters.sport_types) > 1:
+            sport_results["results"] = diversify_sport_results(sport_results["results"], limit=5)
+            sport_results["limit"] = 5
+        results["sports"] = sport_results
 
     return results
 
@@ -298,8 +304,6 @@ def _build_grounded_reply(
         )
 
     return fallback_message, False, None
-
-
 def _get_blocking_issue(issues: list[ResolutionIssue]) -> ResolutionIssue | None:
     if not issues:
         return None
@@ -340,7 +344,7 @@ def _build_issue_reply(*, issue: ResolutionIssue) -> tuple[str, bool, str | None
 
 def _build_filter_descriptor(filters: ActiveFilters, search_domains: list[str]) -> str:
     parts: list[str] = []
-    if search_domains == ["sports"] and filters.sport_types:
+    if search_domains == ["sports"] and len(filters.sport_types) == 1:
         parts.append(f"{filters.sport_types[0].lower()} matches")
     elif search_domains == ["movies"]:
         parts.append("movie options")

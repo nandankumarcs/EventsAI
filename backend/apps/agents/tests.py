@@ -8,10 +8,11 @@ from apps.agents.langchain_tools import (
     invoke_temporal_resolver,
     resolve_turn_filters,
 )
-from apps.agents.schemas import FilterResolution
+from apps.agents.schemas import CatalogInquiry, FilterResolution
 from apps.agents.schemas import ActiveFilters
 from apps.agents.services import ChatTurnError, _derive_filters_to_clear, process_chat_turn
 from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
+from apps.events.services import SearchResult
 
 
 class AgentServiceTests(TestCase):
@@ -53,6 +54,7 @@ class AgentServiceTests(TestCase):
             active_filters={
                 "event_types": ["sports"],
                 "cities": ["New Delhi"],
+                "languages": ["Hindi"],
                 "sport_types": ["Cricket"],
                 "teams": ["Delhi Capitals"],
                 "venue_names": ["Arun Jaitley Stadium"],
@@ -145,6 +147,81 @@ class AgentServiceTests(TestCase):
         self.assertIn("multiple possible matches", payload["assistant_message"]["content"].lower())
 
     @patch("apps.agents.services.resolve_turn_filters")
+    def test_process_chat_turn_broadens_sport_filters_for_catalog_style_question(self, resolve_turn_filters_mock):
+        thread = ChatThread.objects.create(title="Existing thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={
+                "event_types": ["sports"],
+                "event_dates": ["2026-04-12"],
+                "start_time_from": "18:00:00",
+                "start_time_to": "20:00:00",
+            },
+        )
+        resolve_turn_filters_mock.return_value = TurnResolution(
+            updates=ActiveFilters(
+                sport_types=["Badminton", "Cricket", "Football", "Kabaddi"],
+            ),
+            tool_trace=["resolve_temporal", "resolve_sport_catalog_inquiry"],
+        )
+
+        payload = process_chat_turn(
+            user_message="what other sports do you have?",
+            thread_id=str(thread.id),
+        )
+
+        self.assertEqual(payload["search_domains"], ["sports"])
+        self.assertEqual(
+            payload["active_filters"],
+            {
+                "event_types": ["sports"],
+                "event_dates": ["2026-04-12"],
+                "sport_types": ["Badminton", "Cricket", "Football", "Kabaddi"],
+                "start_time_from": "18:00:00",
+                "start_time_to": "20:00:00",
+            },
+        )
+        self.assertIn("event options", payload["assistant_message"]["content"])
+
+    @patch("apps.agents.services.search_sport_events")
+    @patch("apps.agents.services.resolve_turn_filters")
+    def test_process_chat_turn_diversifies_broadened_sport_results(
+        self,
+        resolve_turn_filters_mock,
+        search_sport_events_mock,
+    ):
+        resolve_turn_filters_mock.return_value = TurnResolution(
+            updates=ActiveFilters(
+                event_types=["sports"],
+                cities=["Mumbai"],
+                sport_types=["Badminton", "Cricket", "Football", "Kabaddi"],
+            ),
+            tool_trace=["resolve_event_type", "resolve_sport_catalog_inquiry"],
+        )
+        search_sport_events_mock.return_value = SearchResult(
+            count=6,
+            limit=20,
+            offset=0,
+            filters={},
+            results=[
+                {"listing_code": "1", "title": "Cricket A", "sport_type": "Cricket"},
+                {"listing_code": "2", "title": "Cricket B", "sport_type": "Cricket"},
+                {"listing_code": "3", "title": "Football A", "sport_type": "Football"},
+                {"listing_code": "4", "title": "Kabaddi A", "sport_type": "Kabaddi"},
+                {"listing_code": "5", "title": "Badminton A", "sport_type": "Badminton"},
+                {"listing_code": "6", "title": "Cricket C", "sport_type": "Cricket"},
+            ],
+        )
+
+        payload = process_chat_turn(user_message="what other sports do we have?")
+
+        results = payload["results_by_domain"]["sports"]["results"]
+        self.assertEqual(
+            [item["sport_type"] for item in results[:4]],
+            ["Cricket", "Football", "Kabaddi", "Badminton"],
+        )
+
+    @patch("apps.agents.services.resolve_turn_filters")
     def test_process_chat_turn_rejects_booked_threads(self, resolve_turn_filters_mock):
         thread = ChatThread.objects.create(
             title="Booked thread",
@@ -186,6 +263,7 @@ class AgentLogicTests(TestCase):
             event_types=["sports"],
             cities=["New Delhi"],
             venue_names=["Arun Jaitley Stadium"],
+            languages=["Hindi"],
             sport_types=["Cricket"],
             teams=["Delhi Capitals"],
         )
@@ -196,8 +274,10 @@ class AgentLogicTests(TestCase):
         self.assertIn("sport_types", result)
         self.assertIn("teams", result)
         self.assertIn("venue_names", result)
+        self.assertIn("languages", result)
 
     @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_sport_catalog_inquiry")
     @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
     @patch("apps.agents.langchain_tools.invoke_location_resolver")
     @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
@@ -206,6 +286,7 @@ class AgentLogicTests(TestCase):
         event_type_resolver_mock,
         location_resolver_mock,
         temporal_resolver_mock,
+        sport_catalog_inquiry_mock,
         sport_filter_resolver_mock,
     ):
         event_type_resolver_mock.return_value = FilterResolution(
@@ -214,6 +295,7 @@ class AgentLogicTests(TestCase):
         )
         location_resolver_mock.return_value = FilterResolution(status="no_input")
         temporal_resolver_mock.return_value = FilterResolution(status="no_input")
+        sport_catalog_inquiry_mock.return_value = CatalogInquiry(status="no_input")
         sport_filter_resolver_mock.return_value = FilterResolution(
             status="resolved",
             message="Resolved sport type.",
@@ -229,6 +311,72 @@ class AgentLogicTests(TestCase):
         self.assertEqual(result.updates.sport_types, ["Cricket"])
         self.assertEqual(result.updates.event_types, [])
         self.assertEqual(result.issues, [])
+
+    @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_sport_catalog_inquiry")
+    @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
+    @patch("apps.agents.langchain_tools.invoke_location_resolver")
+    @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    def test_resolve_turn_filters_keeps_catalog_inquiry_out_of_saved_filters(
+        self,
+        event_type_resolver_mock,
+        location_resolver_mock,
+        temporal_resolver_mock,
+        sport_catalog_inquiry_mock,
+        sport_filter_resolver_mock,
+    ):
+        event_type_resolver_mock.return_value = FilterResolution(status="no_input")
+        location_resolver_mock.return_value = FilterResolution(status="no_input")
+        temporal_resolver_mock.return_value = FilterResolution(status="no_input")
+        sport_catalog_inquiry_mock.return_value = CatalogInquiry(
+            status="answer",
+            inquiry_key="sport_types",
+            listed_values=["Badminton", "Cricket", "Football", "Kabaddi"],
+        )
+
+        result = resolve_turn_filters(
+            user_message="what other sports do you have?",
+            current_filters=ActiveFilters(event_types=["sports"], event_dates=["2026-04-12"]),
+            reference_date="2026-04-09",
+        )
+
+        self.assertEqual(
+            result.updates.sport_types,
+            ["Badminton", "Cricket", "Football", "Kabaddi"],
+        )
+        sport_filter_resolver_mock.assert_not_called()
+
+    @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_sport_catalog_inquiry")
+    @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
+    @patch("apps.agents.langchain_tools.invoke_location_resolver")
+    @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    def test_resolve_turn_filters_skips_catalog_inquiry_on_explicit_domain_switch(
+        self,
+        event_type_resolver_mock,
+        location_resolver_mock,
+        temporal_resolver_mock,
+        sport_catalog_inquiry_mock,
+        sport_filter_resolver_mock,
+    ):
+        event_type_resolver_mock.return_value = FilterResolution(
+            status="resolved",
+            message="Resolved event type.",
+            active_filters_partial=ActiveFilters(event_types=["sports"]),
+        )
+        location_resolver_mock.return_value = FilterResolution(status="no_input")
+        temporal_resolver_mock.return_value = FilterResolution(status="no_input")
+        sport_filter_resolver_mock.return_value = FilterResolution(status="no_input")
+
+        result = resolve_turn_filters(
+            user_message="show sports instead",
+            current_filters=ActiveFilters(event_types=["movies"], cities=["Mumbai"], languages=["Hindi"]),
+            reference_date="2026-04-09",
+        )
+
+        self.assertEqual(result.updates.event_types, ["sports"])
+        self.assertEqual(result.updates.sport_types, [])
+        sport_catalog_inquiry_mock.assert_not_called()
 
     @patch("apps.agents.langchain_tools.invoke_movie_filter_resolver")
     @patch("apps.agents.langchain_tools.invoke_temporal_resolver")

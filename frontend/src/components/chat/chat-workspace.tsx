@@ -60,16 +60,13 @@ export function ChatWorkspace({
     <main className="flex min-h-[720px] flex-1 flex-col gap-5">
       <Card className="border-white/80 bg-white/88">
         <CardHeader className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div className="space-y-2">
+          <div className="space-y-1.5">
             <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-primary">
               <Sparkles className="size-4" />
               Event concierge
             </div>
             <CardTitle>{thread?.title ?? 'Start a new conversation'}</CardTitle>
-            <CardDescription>
-              Attend keeps the active filters inside the thread and updates them as the
-              conversation evolves.
-            </CardDescription>
+            <CardDescription>Every message updates this thread’s active search.</CardDescription>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -244,7 +241,7 @@ function MessageBlock({
             {isAssistant ? <Bot className="size-3.5" /> : <UserRound className="size-3.5" />}
             <span>{message.role}</span>
           </div>
-          <p className="text-sm leading-7">{message.content}</p>
+          <p className="text-sm leading-6">{message.content}</p>
 
           {message.metadata.booking_reference ? (
             <div className="mt-3 inline-flex items-center gap-2 rounded-full bg-emerald-500/12 px-3 py-1.5 text-xs font-semibold text-emerald-700">
@@ -285,13 +282,13 @@ function ResultCard({ result, disabled, isBooking, onBook }: ResultCardProps) {
   return (
     <div className="rounded-[24px] border border-border/70 bg-white/86 p-4 shadow-sm">
       <div className="space-y-3">
-        <div>
-          <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="space-y-1.5">
+          <div className="flex items-start justify-between gap-3">
             <div>
               <h3 className="text-base font-semibold text-foreground">{result.title}</h3>
               <p className="mt-1 text-sm text-muted-foreground">{eventTypeLabel}</p>
             </div>
-            <Badge variant="default">{result.listing_code}</Badge>
+            <span className="text-xs font-medium text-muted-foreground">{result.listing_code}</span>
           </div>
         </div>
 
@@ -310,8 +307,8 @@ function ResultCard({ result, disabled, isBooking, onBook }: ResultCardProps) {
 
         {(result.min_price ?? result.max_price) ? (
           <p className="text-sm font-medium text-foreground">
-            From Rs. {result.min_price ?? 0}
-            {result.max_price ? ` to Rs. ${result.max_price}` : ''}
+            Rs. {result.min_price ?? 0}
+            {result.max_price ? ` - ${result.max_price}` : ''}
           </p>
         ) : null}
 
