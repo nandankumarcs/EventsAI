@@ -24,7 +24,7 @@ export function ThreadSidebar({
   onSelectThread,
 }: ThreadSidebarProps) {
   return (
-    <aside className="flex w-full max-w-sm flex-col gap-5">
+    <aside className="flex h-full min-h-0 w-full max-w-sm flex-col gap-5 overflow-hidden">
       <Card className="border-white/80 bg-white/88">
         <CardHeader className="gap-4">
           <div className="flex items-start justify-between gap-4">
@@ -59,12 +59,12 @@ export function ThreadSidebar({
         </CardContent>
       </Card>
 
-      <div className="space-y-3">
+      <div className="flex min-h-0 flex-1 flex-col space-y-3 overflow-hidden">
         <p className="px-1 text-xs font-semibold uppercase tracking-[0.24em] text-muted-foreground">
           Recent threads
         </p>
 
-        <div className="space-y-3">
+        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
           {isLoading ? (
             <Card className="border-dashed bg-white/60">
               <CardContent className="py-8 text-sm text-muted-foreground">

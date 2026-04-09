@@ -1,3 +1,5 @@
+import { useEffect, useRef } from 'react'
+
 import {
   Bot,
   CalendarDays,
@@ -55,10 +57,22 @@ export function ChatWorkspace({
 }: ChatWorkspaceProps) {
   const backendOnline = health?.status === 'ok'
   const isBookedThread = thread?.status === 'booked'
+  const historyRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    const node = historyRef.current
+    if (!node) {
+      return
+    }
+    node.scrollTo({
+      top: node.scrollHeight,
+      behavior: 'smooth',
+    })
+  }, [thread?.id, thread?.messages.length, loadingThread, sending])
 
   return (
-    <main className="flex min-h-[720px] flex-1 flex-col gap-5">
-      <Card className="border-white/80 bg-white/88">
+    <main className="flex h-full min-h-0 flex-1 flex-col gap-4 overflow-hidden">
+      <Card className="flex min-h-0 flex-1 flex-col border-white/80 bg-white/88">
         <CardHeader className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
           <div className="space-y-1.5">
             <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-primary">
@@ -80,7 +94,7 @@ export function ChatWorkspace({
           </div>
         </CardHeader>
 
-        <CardContent className="space-y-4">
+        <CardContent className="flex min-h-0 flex-1 flex-col space-y-4">
           {isBookedThread ? (
             <div className="flex flex-col gap-3 rounded-[22px] border border-emerald-500/20 bg-emerald-500/8 px-4 py-4 text-sm text-emerald-900 sm:flex-row sm:items-center sm:justify-between">
               <div className="space-y-1">
@@ -101,15 +115,15 @@ export function ChatWorkspace({
             </div>
           ) : null}
 
-          <section className="min-h-[480px] rounded-[28px] border border-border/70 bg-background/82 p-4">
+          <section className="flex min-h-0 flex-1 flex-col rounded-[28px] border border-border/70 bg-background/82 p-4">
             {loadingThread ? (
-              <div className="flex min-h-[440px] items-center justify-center text-sm text-muted-foreground">
+              <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">
                 Loading conversation...
               </div>
             ) : null}
 
             {!loadingThread && !thread ? (
-              <div className="flex min-h-[440px] flex-col items-center justify-center gap-4 text-center">
+              <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 text-center">
                 <div className="rounded-full bg-primary/10 p-4 text-primary">
                   <CircleDashed className="size-6" />
                 </div>
@@ -126,7 +140,7 @@ export function ChatWorkspace({
             ) : null}
 
             {!loadingThread && thread ? (
-              <div className="flex max-h-[440px] flex-col gap-4 overflow-y-auto pr-1">
+              <div ref={historyRef} className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-1">
                 {thread.messages.map((message) => (
                   <MessageBlock
                     key={message.id}

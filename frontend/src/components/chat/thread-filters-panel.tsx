@@ -13,8 +13,8 @@ export function ThreadFiltersPanel({ thread }: ThreadFiltersPanelProps) {
   const hasFilters = filterEntries.length > 0
 
   return (
-    <aside className="hidden xl:block">
-      <div className="sticky top-4 space-y-4">
+    <aside className="hidden h-full min-h-0 xl:block">
+      <div className="h-full min-h-0 space-y-4">
         <Card className="border-white/80 bg-white/88">
           <CardHeader className="space-y-2">
             <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-primary">
@@ -27,7 +27,7 @@ export function ThreadFiltersPanel({ thread }: ThreadFiltersPanelProps) {
             </div>
           </CardHeader>
 
-          <CardContent className="space-y-3">
+          <CardContent className="max-h-[calc(100vh-5rem)] space-y-3 overflow-y-auto">
             {thread ? (
               <div className="rounded-[22px] border border-border/70 bg-background/75 p-4">
                 <p className="text-sm font-semibold text-foreground">{thread.title}</p>
