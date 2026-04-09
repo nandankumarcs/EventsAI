@@ -24,10 +24,20 @@ class ActiveFilters(BaseModel):
     directors: list[str] = Field(default_factory=list)
     certifications: list[str] = Field(default_factory=list)
     formats: list[str] = Field(default_factory=list)
+    franchises: list[str] = Field(default_factory=list)
+    content_origins: list[str] = Field(default_factory=list)
     sport_types: list[str] = Field(default_factory=list)
     tournament_names: list[str] = Field(default_factory=list)
+    season_labels: list[str] = Field(default_factory=list)
+    competition_stages: list[str] = Field(default_factory=list)
+    format_labels: list[str] = Field(default_factory=list)
+    home_teams: list[str] = Field(default_factory=list)
+    away_teams: list[str] = Field(default_factory=list)
     teams: list[str] = Field(default_factory=list)
+    participant_names: list[str] = Field(default_factory=list)
     featured_athletes: list[str] = Field(default_factory=list)
+    organizers: list[str] = Field(default_factory=list)
+    match_numbers: list[int] = Field(default_factory=list)
 
 
 class FilterResolution(BaseModel):
@@ -54,4 +64,3 @@ class TurnUpdate(BaseModel):
     search_domains: list[Literal["movies", "sports"]] = Field(default_factory=list)
     result_listing_codes: list[str] = Field(default_factory=list)
     tool_trace: list[str] = Field(default_factory=list)
-

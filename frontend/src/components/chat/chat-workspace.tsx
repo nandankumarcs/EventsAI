@@ -25,11 +25,14 @@ type ChatWorkspaceProps = {
   health: HealthResponse | null
   healthError: string | null
   actionError: string | null
+  actionRetryLabel: string | null
   isCreatingThread: boolean
   onDraftChange: (value: string) => void
   onSend: () => void
   onBook: (listingCode: string) => void
   onCreateThread: () => void
+  onRetryHealth: () => void
+  onRetryAction: () => void
 }
 
 export function ChatWorkspace({
@@ -41,11 +44,14 @@ export function ChatWorkspace({
   health,
   healthError,
   actionError,
+  actionRetryLabel,
   isCreatingThread,
   onDraftChange,
   onSend,
   onBook,
   onCreateThread,
+  onRetryHealth,
+  onRetryAction,
 }: ChatWorkspaceProps) {
   const backendOnline = health?.status === 'ok'
   const isBookedThread = thread?.status === 'booked'
@@ -78,24 +84,6 @@ export function ChatWorkspace({
         </CardHeader>
 
         <CardContent className="space-y-4">
-          {thread?.active_filters && Object.keys(thread.active_filters).length > 0 ? (
-            <div className="space-y-2 rounded-[22px] border border-border/70 bg-background/75 p-3">
-              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                Active filters
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {Object.entries(thread.active_filters).map(([key, value]) => (
-                  <span
-                    key={key}
-                    className="rounded-full bg-accent/70 px-3 py-1.5 text-xs font-medium text-accent-foreground"
-                  >
-                    {formatFilterKey(key)}: {Array.isArray(value) ? value.join(', ') : value}
-                  </span>
-                ))}
-              </div>
-            </div>
-          ) : null}
-
           {isBookedThread ? (
             <div className="flex flex-col gap-3 rounded-[22px] border border-emerald-500/20 bg-emerald-500/8 px-4 py-4 text-sm text-emerald-900 sm:flex-row sm:items-center sm:justify-between">
               <div className="space-y-1">
@@ -156,14 +144,22 @@ export function ChatWorkspace({
           </section>
 
           {healthError ? (
-            <div className="rounded-[22px] border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-700">
-              {healthError}
+            <div className="flex flex-col gap-3 rounded-[22px] border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 sm:flex-row sm:items-center sm:justify-between">
+              <span>{healthError}</span>
+              <Button type="button" variant="outline" size="sm" onClick={onRetryHealth}>
+                Retry connection
+              </Button>
             </div>
           ) : null}
 
           {actionError ? (
-            <div className="rounded-[22px] border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-700">
-              {actionError}
+            <div className="flex flex-col gap-3 rounded-[22px] border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 sm:flex-row sm:items-center sm:justify-between">
+              <span>{actionError}</span>
+              {actionRetryLabel ? (
+                <Button type="button" variant="outline" size="sm" onClick={onRetryAction}>
+                  {actionRetryLabel}
+                </Button>
+              ) : null}
             </div>
           ) : null}
         </CardContent>
@@ -331,12 +327,6 @@ function ResultCard({ result, disabled, isBooking, onBook }: ResultCardProps) {
       </div>
     </div>
   )
-}
-
-function formatFilterKey(value: string) {
-  return value
-    .replace(/_/g, ' ')
-    .replace(/\b\w/g, (character) => character.toUpperCase())
 }
 
 function formatEventDateTime(eventDate: string, startAt: string) {

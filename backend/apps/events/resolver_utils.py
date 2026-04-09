@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from calendar import monthrange
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -201,38 +202,175 @@ def extract_catalog_mentions(
     )
 
 
-def normalize_temporal_expression(
-    text: str,
+def get_temporal_reference(
     *,
-    reference_date: date | None = None,
+    reference_date: date | str | None = None,
     timezone_name: str = "Asia/Kolkata",
 ) -> dict[str, Any]:
+    resolved_reference_date = _coerce_date(reference_date) or timezone.localdate()
+    current_week_start = resolved_reference_date - timedelta(days=resolved_reference_date.weekday())
+    current_week_end = current_week_start + timedelta(days=6)
+    next_week_start = current_week_end + timedelta(days=1)
+    next_week_end = next_week_start + timedelta(days=6)
+    month_start = resolved_reference_date.replace(day=1)
+    month_end = resolved_reference_date.replace(
+        day=monthrange(resolved_reference_date.year, resolved_reference_date.month)[1]
+    )
+    if resolved_reference_date.month == 12:
+        next_month_start = resolved_reference_date.replace(year=resolved_reference_date.year + 1, month=1, day=1)
+    else:
+        next_month_start = resolved_reference_date.replace(month=resolved_reference_date.month + 1, day=1)
+    next_month_end = next_month_start.replace(
+        day=monthrange(next_month_start.year, next_month_start.month)[1]
+    )
+
+    return {
+        "reference_date": resolved_reference_date.isoformat(),
+        "timezone": timezone_name,
+        "weekday_index": resolved_reference_date.weekday(),
+        "weekday_name": resolved_reference_date.strftime("%A"),
+        "current_week_start": current_week_start.isoformat(),
+        "current_week_end": current_week_end.isoformat(),
+        "next_week_start": next_week_start.isoformat(),
+        "next_week_end": next_week_end.isoformat(),
+        "current_month_start": month_start.isoformat(),
+        "current_month_end": month_end.isoformat(),
+        "next_month_start": next_month_start.isoformat(),
+        "next_month_end": next_month_end.isoformat(),
+        "current_month": resolved_reference_date.month,
+        "current_year": resolved_reference_date.year,
+        "current_day": resolved_reference_date.day,
+    }
+
+
+def resolve_weekday_date(
+    *,
+    reference_date: date | str | None,
+    weekday_name: str,
+    scope: str = "upcoming",
+) -> str:
+    resolved_reference_date = _coerce_date(reference_date) or timezone.localdate()
+    normalized_weekday = weekday_name.strip().lower()
+    if normalized_weekday not in WEEKDAY_INDEX:
+        raise ValueError(f"Unsupported weekday: {weekday_name}")
+
+    weekday_index = WEEKDAY_INDEX[normalized_weekday]
+    current_week_start = resolved_reference_date - timedelta(days=resolved_reference_date.weekday())
+
+    if scope == "this_week":
+        return (current_week_start + timedelta(days=weekday_index)).isoformat()
+
+    if scope == "next_week":
+        next_week_start = current_week_start + timedelta(days=7)
+        return (next_week_start + timedelta(days=weekday_index)).isoformat()
+
+    if scope != "upcoming":
+        raise ValueError(f"Unsupported weekday scope: {scope}")
+
+    days_ahead = (weekday_index - resolved_reference_date.weekday()) % 7
+    return (resolved_reference_date + timedelta(days=days_ahead)).isoformat()
+
+
+def build_calendar_date(*, year: int, month: int, day: int) -> str:
+    return date(year, month, day).isoformat()
+
+
+def shift_iso_date(*, date_value: str, days: int) -> str:
+    return (date.fromisoformat(date_value) + timedelta(days=days)).isoformat()
+
+
+def build_date_range(*, start_date: str | None = None, end_date: str | None = None) -> dict[str, str | None]:
+    if start_date is not None:
+        date.fromisoformat(start_date)
+    if end_date is not None:
+        date.fromisoformat(end_date)
+    return {"date_from": start_date, "date_to": end_date}
+
+
+def normalize_clock_time(*, time_text: str) -> dict[str, str]:
+    normalized_text = time_text.strip().lower()
+    regex = re.search(
+        r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+        normalized_text,
+    )
+    if regex is None:
+        raise ValueError(f"Could not normalize time value: {time_text}")
+
+    hour = int(regex.group(1))
+    minute = int(regex.group(2) or "0")
+    meridiem = regex.group(3)
+
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    if meridiem == "am" and hour == 12:
+        hour = 0
+
+    if meridiem is None and hour > 23:
+        raise ValueError(f"Invalid 24-hour time value: {time_text}")
+    if minute > 59:
+        raise ValueError(f"Invalid time value: {time_text}")
+
+    return {"normalized_time": time(hour, minute).isoformat()}
+
+
+def build_time_window(*, anchor_time: str, radius_minutes: int = 60) -> dict[str, str]:
+    anchor = time.fromisoformat(anchor_time)
+    return {
+        "anchor_time": anchor.isoformat(),
+        "start": _shift_time(anchor, -radius_minutes).isoformat(),
+        "end": _shift_time(anchor, radius_minutes).isoformat(),
+    }
+
+
+def get_named_time_bucket(*, label: str) -> dict[str, str]:
+    normalized_label = label.strip().lower()
+    if normalized_label not in TIME_BUCKETS:
+        raise ValueError(f"Unsupported time bucket: {label}")
+
+    start, end, anchor = TIME_BUCKETS[normalized_label]
+    return {
+        "anchor_time": anchor.isoformat(),
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+    }
+
+
+def build_temporal_response_payload(
+    filters: Any,
+    *,
+    reference_date: date | str | None = None,
+    timezone_name: str = "Asia/Kolkata",
+) -> dict[str, Any]:
+    resolved_reference_date = _coerce_date(reference_date) or timezone.localdate()
     tz = ZoneInfo(timezone_name)
-    reference_date = reference_date or timezone.localdate()
-    lowered = text.lower()
+    payload = _coerce_filter_payload(filters)
 
-    resolved_dates = _extract_dates(lowered, reference_date)
-    start_time, end_time, anchor_time = _extract_time_info(lowered)
-    resolved_datetimes = []
+    event_dates = payload.get("event_dates", []) or []
+    date_from = payload.get("date_from")
+    date_to = payload.get("date_to")
+    start_time_from = payload.get("start_time_from")
+    start_time_to = payload.get("start_time_to")
+    anchor_time = _derive_anchor_time(start_time_from, start_time_to)
 
-    if anchor_time and resolved_dates:
-        for resolved_date in resolved_dates:
+    resolved_datetimes: list[str] = []
+    if anchor_time:
+        for event_date in event_dates:
             resolved_datetimes.append(
-                datetime.combine(resolved_date, anchor_time, tzinfo=tz).isoformat()
+                datetime.combine(date.fromisoformat(event_date), anchor_time, tzinfo=tz).isoformat()
             )
 
-    payload: dict[str, Any] = {
-        "reference_date": reference_date.isoformat(),
-        "dates": [value.isoformat() for value in resolved_dates],
+    return {
+        "reference_date": resolved_reference_date.isoformat(),
+        "dates": event_dates,
+        "date_from": date_from,
+        "date_to": date_to,
         "resolved_datetimes": resolved_datetimes,
         "time_range": {
-            "start": start_time.isoformat() if start_time else None,
-            "end": end_time.isoformat() if end_time else None,
+            "start": start_time_from,
+            "end": start_time_to,
         },
         "anchor_time": anchor_time.isoformat() if anchor_time else None,
     }
-
-    return payload
 
 
 def _normalize_requested_values(value: list[str] | str | None) -> list[str]:
@@ -264,61 +402,37 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
 
 
-def _extract_dates(text: str, reference_date: date) -> list[date]:
-    dates: list[date] = []
-
-    if "today" in text:
-        dates.append(reference_date)
-    if "tomorrow" in text:
-        dates.append(reference_date + timedelta(days=1))
-
-    if "weekend" in text:
-        saturday = _next_weekday(reference_date, WEEKDAY_INDEX["saturday"])
-        sunday = _next_weekday(reference_date, WEEKDAY_INDEX["sunday"])
-        dates.extend([saturday, sunday])
-
-    weekday_pattern = re.compile(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b")
-    mentioned_weekdays = [match.group(1) for match in weekday_pattern.finditer(text)]
-
-    for weekday in mentioned_weekdays:
-        dates.append(_next_weekday(reference_date, WEEKDAY_INDEX[weekday]))
-
-    deduped_dates = list(dict.fromkeys(dates))
-    return deduped_dates
-
-
-def _next_weekday(reference_date: date, target_weekday: int) -> date:
-    days_ahead = (target_weekday - reference_date.weekday()) % 7
-    days_ahead = 7 if days_ahead == 0 else days_ahead
-    return reference_date + timedelta(days=days_ahead)
-
-
-def _extract_time_info(text: str) -> tuple[time | None, time | None, time | None]:
-    regex = re.search(
-        r"\b(?:around|at|by)?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
-        text,
-    )
-    if regex:
-        hour = int(regex.group(1))
-        minute = int(regex.group(2) or "0")
-        meridiem = regex.group(3)
-        if meridiem == "pm" and hour != 12:
-            hour += 12
-        if meridiem == "am" and hour == 12:
-            hour = 0
-
-        anchor = time(hour, minute)
-        start = _shift_time(anchor, -60)
-        end = _shift_time(anchor, 60)
-        return start, end, anchor
-
-    for keyword, (start, end, anchor) in TIME_BUCKETS.items():
-        if keyword in text:
-            return start, end, anchor
-
-    return None, None, None
-
-
 def _shift_time(value: time, minutes: int) -> time:
     anchor = datetime.combine(date(2000, 1, 1), value) + timedelta(minutes=minutes)
     return anchor.time()
+
+
+def _coerce_date(value: date | str | None) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(value)
+
+
+def _coerce_filter_payload(filters: Any) -> dict[str, Any]:
+    if hasattr(filters, "model_dump"):
+        return filters.model_dump()
+    if isinstance(filters, dict):
+        return filters
+    raise TypeError("Unsupported filter payload type.")
+
+
+def _derive_anchor_time(
+    start_time_from: str | None,
+    start_time_to: str | None,
+) -> time | None:
+    if not start_time_from or not start_time_to:
+        return None
+
+    start = time.fromisoformat(start_time_from)
+    end = time.fromisoformat(start_time_to)
+    start_dt = datetime.combine(date(2000, 1, 1), start)
+    end_dt = datetime.combine(date(2000, 1, 1), end)
+    midpoint = start_dt + (end_dt - start_dt) / 2
+    return midpoint.time().replace(microsecond=0)

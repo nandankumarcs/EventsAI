@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, field
 from functools import lru_cache
+from typing import Literal
 
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
@@ -15,19 +15,42 @@ from langchain_openai import ChatOpenAI
 from apps.agents.schemas import ActiveFilters, FilterResolution
 from apps.events.filter_tools import (
     get_all_event_types,
+    get_available_movie_cast_members,
+    get_available_movie_certifications,
+    get_available_movie_content_origins,
+    get_available_movie_directors,
+    get_available_movie_formats,
+    get_available_movie_franchises,
     get_available_movie_genres,
     get_available_movie_languages,
     get_available_movie_locations,
     get_available_movie_titles,
     get_available_movie_venues,
+    get_available_sport_away_teams,
+    get_available_sport_competition_stages,
     get_available_sport_featured_athletes,
+    get_available_sport_format_labels,
+    get_available_sport_home_teams,
     get_available_sport_locations,
+    get_available_sport_match_numbers,
+    get_available_sport_organizers,
+    get_available_sport_participant_names,
+    get_available_sport_season_labels,
     get_available_sport_teams,
     get_available_sport_tournaments,
     get_available_sport_types,
     get_available_sport_venues,
 )
-from apps.events.resolver_utils import normalize_temporal_expression
+from apps.events.resolver_utils import (
+    build_calendar_date,
+    build_date_range,
+    build_time_window,
+    get_named_time_bucket,
+    get_temporal_reference,
+    normalize_clock_time,
+    resolve_weekday_date,
+    shift_iso_date,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +59,16 @@ logger = logging.getLogger(__name__)
 class TurnResolution:
     updates: ActiveFilters
     tool_trace: list[str]
+    issues: list["ResolutionIssue"] = field(default_factory=list)
+
+
+@dataclass
+class ResolutionIssue:
+    status: Literal["no_match", "ambiguous"]
+    trace_name: str
+    filter_label: str
+    message: str
+    candidates: list[str]
 
 
 def get_chat_model(*, resolver: bool = False) -> ChatOpenAI:
@@ -99,19 +132,76 @@ def _build_location_agent():
 
 @lru_cache(maxsize=1)
 def _build_temporal_agent():
-    @tool("normalize_temporal_expression")
-    def normalize_temporal_tool(text: str, reference_date: str) -> dict[str, object]:
-        """Resolve relative dates and times using an ISO reference date."""
-        return normalize_temporal_expression(text, reference_date=date.fromisoformat(reference_date))
+    @tool("get_temporal_reference")
+    def temporal_reference_tool(reference_date: str) -> dict[str, object]:
+        """Return the reference date plus week and month boundaries for calendar calculations."""
+        return get_temporal_reference(reference_date=reference_date)
+
+    @tool("resolve_weekday_date")
+    def resolve_weekday_date_tool(reference_date: str, weekday_name: str, scope: str = "upcoming") -> str:
+        """Resolve a weekday into an ISO date. Scope can be upcoming, this_week, or next_week."""
+        return resolve_weekday_date(
+            reference_date=reference_date,
+            weekday_name=weekday_name,
+            scope=scope,
+        )
+
+    @tool("build_calendar_date")
+    def build_calendar_date_tool(year: int, month: int, day: int) -> str:
+        """Build an ISO date from year, month, and day values."""
+        return build_calendar_date(year=year, month=month, day=day)
+
+    @tool("shift_iso_date")
+    def shift_iso_date_tool(date_value: str, days: int) -> str:
+        """Shift an ISO date by a positive or negative number of days."""
+        return shift_iso_date(date_value=date_value, days=days)
+
+    @tool("build_date_range")
+    def build_date_range_tool(start_date: str | None = None, end_date: str | None = None) -> dict[str, str | None]:
+        """Create a date range payload with date_from and date_to."""
+        return build_date_range(start_date=start_date, end_date=end_date)
+
+    @tool("normalize_clock_time")
+    def normalize_clock_time_tool(time_text: str) -> dict[str, str]:
+        """Normalize a time phrase like '7pm' or '7:30 pm' into HH:MM:SS."""
+        return normalize_clock_time(time_text=time_text)
+
+    @tool("build_time_window")
+    def build_time_window_tool(anchor_time: str, radius_minutes: int = 60) -> dict[str, str]:
+        """Build a practical time window around an anchor time."""
+        return build_time_window(anchor_time=anchor_time, radius_minutes=radius_minutes)
+
+    @tool("get_named_time_bucket")
+    def get_named_time_bucket_tool(label: str) -> dict[str, str]:
+        """Return a standard time range for a named period like morning, afternoon, evening, or night."""
+        return get_named_time_bucket(label=label)
 
     return create_agent(
         model=get_chat_model(resolver=True),
-        tools=[normalize_temporal_tool],
+        tools=[
+            temporal_reference_tool,
+            resolve_weekday_date_tool,
+            build_calendar_date_tool,
+            shift_iso_date_tool,
+            build_date_range_tool,
+            normalize_clock_time_tool,
+            build_time_window_tool,
+            get_named_time_bucket_tool,
+        ],
         response_format=ToolStrategy(FilterResolution),
         system_prompt=(
             "You resolve temporal filters from the user request.\n"
-            "You must call normalize_temporal_expression when the request mentions a day, date, period, or time.\n"
-            "Return event_dates, start_time_from, and start_time_to in active_filters_partial when present.\n"
+            "The user message is provided as JSON with user_message and reference_date.\n"
+            "You must use tools for any calendar or clock calculation. Do not do date math in your head.\n"
+            "Use exact-date mode for discrete dates like 'today', 'tomorrow', 'this sunday', 'sunday or monday', or named weekdays.\n"
+            "In exact-date mode, populate active_filters_partial.event_dates and leave date_from/date_to empty.\n"
+            "Use range mode for phrases like 'after', 'before', 'from', 'until', 'next week', 'this week', 'next month', or 'after 13th this month'.\n"
+            "In range mode, populate date_from/date_to and leave event_dates empty.\n"
+            "For 'after X', date_from should be the first included day after X unless the user explicitly says 'on or after'.\n"
+            "For 'around 7pm' or similar exact times, normalize the time first and then build a practical window.\n"
+            "For broad periods like evening or night, use the named time bucket tool.\n"
+            "Return only event_dates, date_from, date_to, start_time_from, and start_time_to in active_filters_partial.\n"
+            "If the message contains no temporal intent, return status no_input.\n"
             "Return no_input if the message contains no temporal intent."
         ),
     )
@@ -129,6 +219,21 @@ def _build_movie_filter_agent():
         """Return movie genres currently available."""
         return get_available_movie_genres()
 
+    @tool("get_movie_cast_members")
+    def movie_cast_members() -> list[str]:
+        """Return movie cast members currently available."""
+        return get_available_movie_cast_members()
+
+    @tool("get_movie_directors")
+    def movie_directors() -> list[str]:
+        """Return movie directors currently available."""
+        return get_available_movie_directors()
+
+    @tool("get_movie_certifications")
+    def movie_certifications() -> list[str]:
+        """Return movie certifications currently available."""
+        return get_available_movie_certifications()
+
     @tool("get_movie_languages")
     def movie_languages() -> list[str]:
         """Return movie languages currently available."""
@@ -139,16 +244,42 @@ def _build_movie_filter_agent():
         """Return movie venues currently available."""
         return get_available_movie_venues()
 
+    @tool("get_movie_formats")
+    def movie_formats() -> list[str]:
+        """Return movie formats currently available."""
+        return get_available_movie_formats()
+
+    @tool("get_movie_franchises")
+    def movie_franchises() -> list[str]:
+        """Return movie franchises currently available."""
+        return get_available_movie_franchises()
+
+    @tool("get_movie_content_origins")
+    def movie_content_origins() -> list[str]:
+        """Return movie content origin labels currently available."""
+        return get_available_movie_content_origins()
+
     return create_agent(
         model=get_chat_model(resolver=True),
-        tools=[movie_titles, movie_genres, movie_languages, movie_venues],
+        tools=[
+            movie_titles,
+            movie_genres,
+            movie_cast_members,
+            movie_directors,
+            movie_certifications,
+            movie_languages,
+            movie_venues,
+            movie_formats,
+            movie_franchises,
+            movie_content_origins,
+        ],
         response_format=ToolStrategy(FilterResolution),
         system_prompt=(
             "You resolve movie-specific filters from the user request.\n"
             "You must rely on the tool outputs and return only exact canonical values from them.\n"
             "Only resolve values the user explicitly requested or clearly described.\n"
             "Do not infer a venue, title, genre, or language from a city mention alone.\n"
-            "Return titles, genres, languages, and venue_names in active_filters_partial.\n"
+            "Return titles, genres, cast_members, directors, certifications, languages, venue_names, formats, franchises, and content_origins in active_filters_partial.\n"
             "If the message contains no movie-specific filter intent, return no_input."
         ),
     )
@@ -166,10 +297,40 @@ def _build_sport_filter_agent():
         """Return sport tournaments currently available."""
         return get_available_sport_tournaments()
 
+    @tool("get_sport_season_labels")
+    def sport_season_labels() -> list[str]:
+        """Return sport season labels currently available."""
+        return get_available_sport_season_labels()
+
+    @tool("get_sport_competition_stages")
+    def sport_competition_stages() -> list[str]:
+        """Return sport competition stages currently available."""
+        return get_available_sport_competition_stages()
+
+    @tool("get_sport_format_labels")
+    def sport_format_labels() -> list[str]:
+        """Return sport format labels currently available."""
+        return get_available_sport_format_labels()
+
+    @tool("get_sport_home_teams")
+    def sport_home_teams() -> list[str]:
+        """Return sport home teams currently available."""
+        return get_available_sport_home_teams()
+
+    @tool("get_sport_away_teams")
+    def sport_away_teams() -> list[str]:
+        """Return sport away teams currently available."""
+        return get_available_sport_away_teams()
+
     @tool("get_sport_teams")
     def sport_teams() -> list[str]:
         """Return sport teams currently available."""
         return get_available_sport_teams()
+
+    @tool("get_sport_participant_names")
+    def sport_participant_names() -> list[str]:
+        """Return sport participant names currently available."""
+        return get_available_sport_participant_names()
 
     @tool("get_sport_venues")
     def sport_venues() -> list[str]:
@@ -181,16 +342,40 @@ def _build_sport_filter_agent():
         """Return sport athletes currently available."""
         return get_available_sport_featured_athletes()
 
+    @tool("get_sport_organizers")
+    def sport_organizers() -> list[str]:
+        """Return sport organizers currently available."""
+        return get_available_sport_organizers()
+
+    @tool("get_sport_match_numbers")
+    def sport_match_numbers() -> list[int]:
+        """Return sport match numbers currently available."""
+        return get_available_sport_match_numbers()
+
     return create_agent(
         model=get_chat_model(resolver=True),
-        tools=[sport_types, sport_tournaments, sport_teams, sport_venues, sport_athletes],
+        tools=[
+            sport_types,
+            sport_tournaments,
+            sport_season_labels,
+            sport_competition_stages,
+            sport_format_labels,
+            sport_home_teams,
+            sport_away_teams,
+            sport_teams,
+            sport_participant_names,
+            sport_venues,
+            sport_athletes,
+            sport_organizers,
+            sport_match_numbers,
+        ],
         response_format=ToolStrategy(FilterResolution),
         system_prompt=(
             "You resolve sport-specific filters from the user request.\n"
             "You must rely on the tool outputs and return only exact canonical values from them.\n"
             "Only resolve a sport type, tournament, team, venue, or athlete when the user explicitly requests it or clearly describes it.\n"
             "Do not infer teams or venues from a city mention. For example, a message like 'Mumbai works better' updates city only and should not set teams or venues.\n"
-            "Return sport_types, tournament_names, teams, venue_names, and featured_athletes in active_filters_partial.\n"
+            "Return sport_types, tournament_names, season_labels, competition_stages, format_labels, home_teams, away_teams, teams, participant_names, venue_names, featured_athletes, organizers, and match_numbers in active_filters_partial.\n"
             "If the message contains no sport-specific filter intent, return no_input."
         ),
     )
@@ -218,21 +403,22 @@ def invoke_location_resolver(user_message: str, domains: list[str] | None = None
 
 
 def invoke_temporal_resolver(user_message: str, reference_date: str) -> FilterResolution:
-    normalized = normalize_temporal_expression(user_message, reference_date=date.fromisoformat(reference_date))
-    has_temporal_filters = bool(
-        normalized["dates"]
-        or normalized["time_range"]["start"]
-        or normalized["time_range"]["end"]
-    )
-    return FilterResolution(
-        status="resolved" if has_temporal_filters else "no_input",
-        message="Resolved temporal filters.",
-        confidence=0.98 if has_temporal_filters else 0.0,
-        active_filters_partial=ActiveFilters(
-            event_dates=normalized["dates"],
-            start_time_from=normalized["time_range"]["start"],
-            start_time_to=normalized["time_range"]["end"],
+    return _invoke_filter_resolution_agent(
+        agent=_build_temporal_agent(),
+        user_content=json.dumps(
+            {
+                "user_message": user_message,
+                "reference_date": reference_date,
+            }
         ),
+        trace_name="resolve_temporal",
+        allowed_fields={
+            "event_dates",
+            "date_from",
+            "date_to",
+            "start_time_from",
+            "start_time_to",
+        },
     )
 
 
@@ -241,12 +427,23 @@ def invoke_movie_filter_resolver(user_message: str) -> FilterResolution:
         agent=_build_movie_filter_agent(),
         user_content=json.dumps({"user_message": user_message}),
         trace_name="resolve_movie_filters",
-        allowed_fields={"titles", "genres", "languages", "venue_names"},
+        allowed_fields={
+            "titles",
+            "genres",
+            "cast_members",
+            "directors",
+            "certifications",
+            "languages",
+            "venue_names",
+            "formats",
+            "franchises",
+            "content_origins",
+        },
     )
     return _sanitize_explicit_entity_fields(
         resolution=resolution,
         user_message=user_message,
-        explicit_fields={"titles", "venue_names"},
+        explicit_fields={"titles", "venue_names", "cast_members", "directors", "franchises"},
     )
 
 
@@ -255,12 +452,34 @@ def invoke_sport_filter_resolver(user_message: str) -> FilterResolution:
         agent=_build_sport_filter_agent(),
         user_content=json.dumps({"user_message": user_message}),
         trace_name="resolve_sport_filters",
-        allowed_fields={"sport_types", "tournament_names", "teams", "venue_names", "featured_athletes"},
+        allowed_fields={
+            "sport_types",
+            "tournament_names",
+            "season_labels",
+            "competition_stages",
+            "format_labels",
+            "home_teams",
+            "away_teams",
+            "teams",
+            "participant_names",
+            "venue_names",
+            "featured_athletes",
+            "organizers",
+            "match_numbers",
+        },
     )
     return _sanitize_explicit_entity_fields(
         resolution=resolution,
         user_message=user_message,
-        explicit_fields={"teams", "venue_names", "featured_athletes"},
+        explicit_fields={
+            "home_teams",
+            "away_teams",
+            "teams",
+            "participant_names",
+            "venue_names",
+            "featured_athletes",
+            "organizers",
+        },
     )
 
 
@@ -272,16 +491,34 @@ def resolve_turn_filters(
 ) -> TurnResolution:
     trace: list[str] = []
     updates = ActiveFilters()
+    issues: list[ResolutionIssue] = []
+    current_domains = current_filters.event_types
 
     event_type_resolution = invoke_event_type_resolver(user_message)
     trace.append("resolve_event_type")
-    updates = _merge_active_filters(updates, _partial_from_resolution(event_type_resolution))
+    if _should_apply_event_type_resolution(
+        resolution=event_type_resolution,
+        current_domains=current_domains,
+    ):
+        updates = _merge_active_filters(updates, _partial_from_resolution(event_type_resolution))
+        _append_resolution_issue(
+            issues=issues,
+            resolution=event_type_resolution,
+            trace_name="resolve_event_type",
+            filter_label="event type",
+        )
 
-    effective_domains = updates.event_types or current_filters.event_types
+    effective_domains = updates.event_types or current_domains
 
     location_resolution = invoke_location_resolver(user_message, effective_domains or None)
     trace.append("resolve_location")
     updates = _merge_active_filters(updates, _partial_from_resolution(location_resolution))
+    _append_resolution_issue(
+        issues=issues,
+        resolution=location_resolution,
+        trace_name="resolve_location",
+        filter_label="location",
+    )
 
     temporal_resolution = invoke_temporal_resolver(user_message, reference_date)
     trace.append("resolve_temporal")
@@ -291,13 +528,25 @@ def resolve_turn_filters(
         movie_resolution = invoke_movie_filter_resolver(user_message)
         trace.append("resolve_movie_filters")
         updates = _merge_active_filters(updates, _partial_from_resolution(movie_resolution))
+        _append_resolution_issue(
+            issues=issues,
+            resolution=movie_resolution,
+            trace_name="resolve_movie_filters",
+            filter_label="movie filters",
+        )
 
     if "sports" in effective_domains:
         sport_resolution = invoke_sport_filter_resolver(user_message)
         trace.append("resolve_sport_filters")
         updates = _merge_active_filters(updates, _partial_from_resolution(sport_resolution))
+        _append_resolution_issue(
+            issues=issues,
+            resolution=sport_resolution,
+            trace_name="resolve_sport_filters",
+            filter_label="sports filters",
+        )
 
-    return TurnResolution(updates=updates, tool_trace=trace)
+    return TurnResolution(updates=updates, tool_trace=trace, issues=issues)
 
 
 def _invoke_filter_resolution_agent(*, agent, user_content: str, trace_name: str, allowed_fields: set[str]) -> FilterResolution:
@@ -371,6 +620,44 @@ def _merge_active_filters(base: ActiveFilters, updates: ActiveFilters) -> Active
             continue
         merged[key] = value
     return ActiveFilters.model_validate(merged)
+
+
+def _append_resolution_issue(
+    *,
+    issues: list[ResolutionIssue],
+    resolution: FilterResolution,
+    trace_name: str,
+    filter_label: str,
+) -> None:
+    if resolution.status not in {"no_match", "ambiguous"}:
+        return
+
+    issues.append(
+        ResolutionIssue(
+            status=resolution.status,
+            trace_name=trace_name,
+            filter_label=filter_label,
+            message=resolution.message,
+            candidates=list(resolution.candidates or []),
+        )
+    )
+
+
+def _should_apply_event_type_resolution(
+    *,
+    resolution: FilterResolution,
+    current_domains: list[str],
+) -> bool:
+    if len(current_domains) != 1:
+        return True
+
+    current_domain = current_domains[0]
+    resolved_domains = resolution.active_filters_partial.event_types
+
+    if resolution.status == "resolved":
+        return bool(resolved_domains and resolved_domains != [current_domain])
+
+    return False
 
 
 def _looks_explicit_in_message(user_message: str, candidate_value: str) -> bool:

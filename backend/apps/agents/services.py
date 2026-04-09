@@ -5,7 +5,7 @@ from typing import Any
 from django.db.models import Max
 from django.utils import timezone
 
-from apps.agents.langchain_tools import resolve_turn_filters
+from apps.agents.langchain_tools import ResolutionIssue, resolve_turn_filters
 from apps.agents.schemas import ActiveFilters
 from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
 from apps.events.services import search_movie_events, search_sport_events
@@ -17,13 +17,23 @@ MOVIE_FILTER_KEYS = {
     "directors",
     "certifications",
     "formats",
+    "franchises",
+    "content_origins",
 }
 
 SPORT_FILTER_KEYS = {
     "sport_types",
     "tournament_names",
+    "season_labels",
+    "competition_stages",
+    "format_labels",
+    "home_teams",
+    "away_teams",
     "teams",
+    "participant_names",
     "featured_athletes",
+    "organizers",
+    "match_numbers",
 }
 
 SHARED_SWITCH_CLEAR_KEYS = {
@@ -65,19 +75,28 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
         filters_to_clear=filters_to_clear,
     )
 
-    search_domains = _derive_search_domains(merged_filters)
-    results_by_domain = _fetch_results_by_domain(merged_filters, search_domains)
-    result_listing_codes = [
-        item["listing_code"]
-        for domain_results in results_by_domain.values()
-        for item in domain_results["results"]
-    ]
-    assistant_content, needs_clarification, clarification_question = _build_grounded_reply(
-        filters=merged_filters,
-        search_domains=search_domains,
-        results_by_domain=results_by_domain,
-        fallback_message="",
-    )
+    blocking_issue = _get_blocking_issue(turn_resolution.issues)
+    if blocking_issue is not None:
+        search_domains: list[str] = []
+        results_by_domain: dict[str, dict[str, Any]] = {}
+        result_listing_codes: list[str] = []
+        assistant_content, needs_clarification, clarification_question = _build_issue_reply(
+            issue=blocking_issue,
+        )
+    else:
+        search_domains = _derive_search_domains(merged_filters)
+        results_by_domain = _fetch_results_by_domain(merged_filters, search_domains)
+        result_listing_codes = [
+            item["listing_code"]
+            for domain_results in results_by_domain.values()
+            for item in domain_results["results"]
+        ]
+        assistant_content, needs_clarification, clarification_question = _build_grounded_reply(
+            filters=merged_filters,
+            search_domains=search_domains,
+            results_by_domain=results_by_domain,
+            fallback_message="",
+        )
 
     thread_filter.active_filters = _compact_filter_state(merged_filters.model_dump())
     thread_filter.resolver_trace = turn_resolution.tool_trace
@@ -92,6 +111,16 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
         "result_listing_codes": result_listing_codes,
         "results_by_domain": results_by_domain,
         "active_filters": thread_filter.active_filters,
+        "resolution_issues": [
+            {
+                "status": issue.status,
+                "trace_name": issue.trace_name,
+                "filter_label": issue.filter_label,
+                "message": issue.message,
+                "candidates": issue.candidates,
+            }
+            for issue in turn_resolution.issues
+        ],
     }
     assistant_message = _append_message(
         thread,
@@ -269,6 +298,44 @@ def _build_grounded_reply(
         )
 
     return fallback_message, False, None
+
+
+def _get_blocking_issue(issues: list[ResolutionIssue]) -> ResolutionIssue | None:
+    if not issues:
+        return None
+
+    for status in ("ambiguous", "no_match"):
+        for issue in issues:
+            if issue.status == status:
+                return issue
+    return None
+
+
+def _build_issue_reply(*, issue: ResolutionIssue) -> tuple[str, bool, str | None]:
+    if issue.status == "ambiguous":
+        if issue.candidates:
+            options = ", ".join(issue.candidates[:4])
+            question = f"Did you mean {options}?"
+            return (
+                f"I found multiple possible matches for the {issue.filter_label}. {question}",
+                True,
+                question,
+            )
+
+        question = f"Could you clarify which {issue.filter_label} you want?"
+        return (
+            f"I found multiple possible matches for the {issue.filter_label}. {question}",
+            True,
+            question,
+        )
+
+    question = f"Would you like to try a different {issue.filter_label}?"
+    message = issue.message or f"I could not match that {issue.filter_label} to the available catalog."
+    return (
+        f"{message} {question}",
+        True,
+        question,
+    )
 
 
 def _build_filter_descriptor(filters: ActiveFilters, search_domains: list[str]) -> str:

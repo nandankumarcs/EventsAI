@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { ChatWorkspace } from '@/components/chat/chat-workspace'
+import { ThreadFiltersPanel } from '@/components/chat/thread-filters-panel'
 import { ThreadSidebar } from '@/components/chat/thread-sidebar'
 import {
   confirmBooking,
@@ -27,30 +28,72 @@ function App() {
   const [sending, setSending] = useState(false)
   const [creatingThread, setCreatingThread] = useState(false)
   const [bookingListingCode, setBookingListingCode] = useState<string | null>(null)
+  const [actionRetryLabel, setActionRetryLabel] = useState<string | null>(null)
+  const actionRetryRef = useRef<null | (() => Promise<void> | void)>(null)
 
   useEffect(() => {
     let cancelled = false
 
-    async function bootstrap() {
-      try {
-        const [nextHealth, threadPayload] = await Promise.all([
-          fetchHealth(),
-          listThreads(),
-        ])
+    async function bootstrapOnMount() {
+      setThreadsLoading(true)
+      setHealthError(null)
 
+      try {
+        const [nextHealth, threadPayload] = await Promise.all([fetchHealth(), listThreads()])
         if (cancelled) {
           return
         }
 
         setHealth(nextHealth)
-        setHealthError(null)
         setThreads(threadPayload.threads)
 
         const firstThread = threadPayload.threads[0]
         if (firstThread) {
+          setThreadLoading(true)
+          setActionError(null)
           setSelectedThreadId(firstThread.id)
-          void loadThread(firstThread.id, { silent: false })
+
+          try {
+            const payload = await fetchThread(firstThread.id)
+            if (cancelled) {
+              return
+            }
+            setSelectedThread(payload.thread)
+            setSelectedThreadId(payload.thread.id)
+          } catch (error) {
+            if (cancelled) {
+              return
+            }
+            setActionError(error instanceof Error ? error.message : 'Unable to load thread.')
+            actionRetryRef.current = async () => {
+              setThreadLoading(true)
+              setActionError(null)
+              clearActionRetry()
+
+              try {
+                const payload = await fetchThread(firstThread.id)
+                setSelectedThread(payload.thread)
+                setSelectedThreadId(payload.thread.id)
+              } catch (retryError) {
+                setActionError(
+                  retryError instanceof Error ? retryError.message : 'Unable to load thread.',
+                )
+                setActionRetryLabel('Retry loading thread')
+              } finally {
+                setThreadLoading(false)
+                setThreadsLoading(false)
+              }
+            }
+            setActionRetryLabel('Retry loading thread')
+          } finally {
+            if (!cancelled) {
+              setThreadLoading(false)
+              setThreadsLoading(false)
+            }
+          }
         } else {
+          setSelectedThread(null)
+          setSelectedThreadId(null)
           setThreadsLoading(false)
         }
       } catch (error) {
@@ -58,20 +101,51 @@ function App() {
           return
         }
         setThreadsLoading(false)
-        setHealthError(
-          error instanceof Error
-            ? error.message
-            : 'Unable to reach the backend.',
-        )
+        setHealthError(error instanceof Error ? error.message : 'Unable to reach the backend.')
       }
     }
 
-    void bootstrap()
+    void bootstrapOnMount()
 
     return () => {
       cancelled = true
     }
   }, [])
+
+  function clearActionRetry() {
+    actionRetryRef.current = null
+    setActionRetryLabel(null)
+  }
+
+  function registerActionRetry(label: string, action: () => Promise<void> | void) {
+    actionRetryRef.current = action
+    setActionRetryLabel(label)
+  }
+
+  async function bootstrapApp() {
+    setThreadsLoading(true)
+    setHealthError(null)
+
+    try {
+      const [nextHealth, threadPayload] = await Promise.all([fetchHealth(), listThreads()])
+
+      setHealth(nextHealth)
+      setThreads(threadPayload.threads)
+
+      const firstThread = threadPayload.threads[0]
+      if (firstThread) {
+        setSelectedThreadId(firstThread.id)
+        await loadThread(firstThread.id, { silent: false })
+      } else {
+        setSelectedThread(null)
+        setSelectedThreadId(null)
+        setThreadsLoading(false)
+      }
+    } catch (error) {
+      setThreadsLoading(false)
+      setHealthError(error instanceof Error ? error.message : 'Unable to reach the backend.')
+    }
+  }
 
   async function refreshThreads(preferredThreadId?: string) {
     const payload = await listThreads()
@@ -98,13 +172,16 @@ function App() {
       setThreadLoading(true)
     }
     setActionError(null)
+    clearActionRetry()
 
     try {
       const payload = await fetchThread(threadId)
       setSelectedThread(payload.thread)
       setSelectedThreadId(payload.thread.id)
+      clearActionRetry()
     } catch (error) {
       setActionError(error instanceof Error ? error.message : 'Unable to load thread.')
+      registerActionRetry('Retry loading thread', () => loadThread(threadId, options))
     } finally {
       setThreadLoading(false)
       setThreadsLoading(false)
@@ -114,6 +191,7 @@ function App() {
   async function handleCreateThread() {
     setCreatingThread(true)
     setActionError(null)
+    clearActionRetry()
 
     try {
       const payload = await createThread()
@@ -121,8 +199,10 @@ function App() {
       setSelectedThread(payload.thread)
       setSelectedThreadId(payload.thread.id)
       setDraft('')
+      clearActionRetry()
     } catch (error) {
       setActionError(error instanceof Error ? error.message : 'Unable to create thread.')
+      registerActionRetry('Retry creating thread', handleCreateThread)
     } finally {
       setCreatingThread(false)
     }
@@ -139,6 +219,7 @@ function App() {
       return
     }
     if (selectedThread?.status === 'booked') {
+      clearActionRetry()
       setActionError(
         'This thread already has a confirmed booking. Start a new thread to plan another event.',
       )
@@ -147,6 +228,7 @@ function App() {
 
     setSending(true)
     setActionError(null)
+    clearActionRetry()
 
     try {
       const payload = await sendChatMessage(message, selectedThreadId ?? undefined)
@@ -154,8 +236,10 @@ function App() {
       const nextThreadId = payload.thread.id
       await refreshThreads(nextThreadId)
       await loadThread(nextThreadId, { silent: true })
+      clearActionRetry()
     } catch (error) {
       setActionError(error instanceof Error ? error.message : 'Unable to send message.')
+      registerActionRetry('Retry sending message', handleSend)
     } finally {
       setSending(false)
     }
@@ -168,23 +252,35 @@ function App() {
 
     setBookingListingCode(listingCode)
     setActionError(null)
+    clearActionRetry()
 
     try {
       await confirmBooking(selectedThreadId, listingCode)
       await refreshThreads(selectedThreadId)
       await loadThread(selectedThreadId, { silent: true })
+      clearActionRetry()
     } catch (error) {
       setActionError(
         error instanceof Error ? error.message : 'Unable to confirm booking.',
       )
+      registerActionRetry('Retry booking confirmation', () => handleBook(listingCode))
     } finally {
       setBookingListingCode(null)
     }
   }
 
+  async function handleRetryAction() {
+    if (!actionRetryRef.current) {
+      return
+    }
+
+    setActionError(null)
+    await actionRetryRef.current()
+  }
+
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-[1500px] flex-col px-4 py-4 sm:px-6 lg:px-8">
-      <div className="grid flex-1 gap-6 lg:grid-cols-[320px_minmax(0,1fr)]">
+      <div className="grid flex-1 gap-6 lg:grid-cols-[320px_minmax(0,1fr)] xl:grid-cols-[320px_minmax(0,1fr)_320px]">
         <ThreadSidebar
           threads={threads}
           selectedThreadId={selectedThreadId}
@@ -202,12 +298,16 @@ function App() {
           health={health}
           healthError={healthError}
           actionError={actionError}
+          actionRetryLabel={actionRetryLabel}
           isCreatingThread={creatingThread}
           onDraftChange={setDraft}
           onSend={handleSend}
           onBook={handleBook}
           onCreateThread={handleCreateThread}
+          onRetryHealth={bootstrapApp}
+          onRetryAction={handleRetryAction}
         />
+        <ThreadFiltersPanel thread={selectedThread} />
       </div>
     </div>
   )
