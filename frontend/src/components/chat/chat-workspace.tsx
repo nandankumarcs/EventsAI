@@ -5,19 +5,22 @@ import {
   CalendarDays,
   ChevronLeft,
   ChevronRight,
-  CircleDashed,
   MapPin,
   Plus,
   SendHorizontal,
   Sparkles,
   TicketCheck,
-  UserRound,
 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import type { HealthResponse, SearchResultItem, ThreadDetail, ThreadMessage } from '@/lib/api'
+import type {
+  PendingBooking,
+  SearchResultItem,
+  ThreadDetail,
+  ThreadMessage,
+} from '@/lib/api'
 
 type ChatWorkspaceProps = {
   thread: ThreadDetail | null
@@ -25,7 +28,6 @@ type ChatWorkspaceProps = {
   sending: boolean
   bookingListingCode: string | null
   loadingThread: boolean
-  health: HealthResponse | null
   healthError: string | null
   actionError: string | null
   actionRetryLabel: string | null
@@ -44,7 +46,6 @@ export function ChatWorkspace({
   sending,
   bookingListingCode,
   loadingThread,
-  health,
   healthError,
   actionError,
   actionRetryLabel,
@@ -56,8 +57,9 @@ export function ChatWorkspace({
   onRetryHealth,
   onRetryAction,
 }: ChatWorkspaceProps) {
-  const backendOnline = health?.status === 'ok'
   const isBookedThread = thread?.status === 'booked'
+  const pendingBooking = isPendingBooking(thread?.pending_booking) ? thread.pending_booking : null
+  const awaitingFieldLabel = formatAwaitingFieldLabel(pendingBooking?.awaiting_field)
   const historyRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
@@ -80,12 +82,6 @@ export function ChatWorkspace({
           <span>{thread?.title ?? 'New conversation'}</span>
         </div>
         <div className="flex items-center gap-2">
-          <Badge variant={backendOnline ? 'success' : 'warning'}>
-            {backendOnline ? 'Backend connected' : 'Backend offline'}
-          </Badge>
-          <Badge variant={health?.database.reachable ? 'success' : 'warning'}>
-            {health?.database.reachable ? 'Database ready' : 'Database pending'}
-          </Badge>
           {thread?.status === 'booked' ? <Badge variant="success">Booking saved</Badge> : null}
         </div>
       </header>
@@ -113,26 +109,42 @@ export function ChatWorkspace({
             </div>
           ) : null}
 
+          {!isBookedThread && pendingBooking?.event_snapshot ? (
+            <div className="space-y-3 rounded-[22px] border border-amber-500/25 bg-amber-500/8 px-4 py-4">
+              <div className="space-y-1">
+                <p className="text-sm font-semibold text-foreground">Pending booking confirmation</p>
+                <p className="text-sm text-muted-foreground">
+                  {awaitingFieldLabel
+                    ? `Reply with your ${awaitingFieldLabel} to continue this booking.`
+                    : 'Reply with `yes` to confirm this event or `no` to clear it.'}
+                </p>
+              </div>
+              <div className="max-w-[286px]">
+                <ResultCard
+                  result={normalizePendingBookingResult(pendingBooking)}
+                  disabled
+                  isBooking={false}
+                  buttonLabelOverride={awaitingFieldLabel ? `Awaiting ${awaitingFieldLabel}` : 'Awaiting chat confirmation'}
+                  onBook={onBook}
+                />
+              </div>
+            </div>
+          ) : null}
+
           {loadingThread ? (
             <div className="flex min-h-[50vh] items-center justify-center text-sm text-muted-foreground">
               Loading conversation...
             </div>
           ) : null}
 
-          {!loadingThread && !thread ? (
-            <div className="flex min-h-[50vh] flex-col items-center justify-center gap-4 text-center">
-              <div className="rounded-full bg-primary/10 p-4 text-primary">
-                <CircleDashed className="size-6" />
-              </div>
-              <div className="space-y-2">
-                <h2 className="font-display text-2xl text-foreground">
-                  Tell EventsAI what you are in the mood for
-                </h2>
-                <p className="max-w-lg text-sm leading-7 text-muted-foreground">
-                  Try something like “I want to watch a cricket match this Sunday in
-                  Mumbai around 7pm” and keep refining the same thread.
-                </p>
-              </div>
+          {!loadingThread && (!thread || thread.messages.length === 0) && !sending ? (
+            <div className="flex flex-col items-center justify-center gap-2 pt-24 pb-8 min-h-[50vh] text-center">
+              <h1 className="text-[28px] font-medium tracking-tight text-foreground/80">
+                {getGreeting()}
+              </h1>
+              <p className="text-xl text-muted-foreground/80">
+                What event are we planning today?
+              </p>
             </div>
           ) : null}
 
@@ -147,6 +159,24 @@ export function ChatWorkspace({
                   onBook={onBook}
                 />
               ))}
+              
+              {sending ? (
+                <div className="flex w-full justify-start">
+                  <div className="max-w-full space-y-3 w-full">
+                    <div className="bg-transparent text-foreground">
+                      <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                        <Bot className="size-4" />
+                        <span>Events AI</span>
+                      </div>
+                      <div className="flex space-x-1.5 mt-2 h-6 items-center">
+                        <div className="w-2 h-2 bg-primary/40 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
+                        <div className="w-2 h-2 bg-primary/40 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
+                        <div className="w-2 h-2 bg-primary/40 rounded-full animate-bounce"></div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
             </div>
           ) : null}
 
@@ -243,6 +273,7 @@ function MessageBlock({
   const isAssistant = message.role === 'assistant'
   const resultsByDomain = message.metadata.results_by_domain ?? {}
   const allResults = Object.values(resultsByDomain).flatMap((domain) => domain.results)
+  const selectedBookingResult = getSelectedBookingResult(message)
 
   return (
     <div className={`flex w-full ${isAssistant ? 'justify-start' : 'justify-end'}`}>
@@ -275,6 +306,18 @@ function MessageBlock({
             bookingListingCode={bookingListingCode}
             onBook={onBook}
           />
+        ) : null}
+
+        {isAssistant && selectedBookingResult ? (
+          <div className="max-w-[286px]">
+            <ResultCard
+              result={selectedBookingResult}
+              disabled
+              isBooking={false}
+              buttonLabelOverride="Awaiting chat confirmation"
+              onBook={onBook}
+            />
+          </div>
         ) : null}
       </div>
     </div>
@@ -362,10 +405,11 @@ type ResultCardProps = {
   result: SearchResultItem
   disabled: boolean
   isBooking: boolean
+  buttonLabelOverride?: string
   onBook: (listingCode: string) => void
 }
 
-function ResultCard({ result, disabled, isBooking, onBook }: ResultCardProps) {
+function ResultCard({ result, disabled, isBooking, buttonLabelOverride, onBook }: ResultCardProps) {
   const eventTypeLabel = result.sport_type ?? result.genres?.slice(0, 2).join(', ') ?? 'Event'
 
   return (
@@ -405,11 +449,71 @@ function ResultCard({ result, disabled, isBooking, onBook }: ResultCardProps) {
           onClick={() => onBook(result.listing_code)}
         >
           <TicketCheck className="size-4" />
-          {disabled ? 'Booking saved' : isBooking ? 'Confirming...' : 'Confirm booking'}
+          {buttonLabelOverride ?? (disabled ? 'Booking saved' : isBooking ? 'Confirming...' : 'Confirm booking')}
         </Button>
       </div>
     </div>
   )
+}
+
+function isPendingBooking(value: ThreadDetail['pending_booking'] | null | undefined): value is PendingBooking {
+  return Boolean(value && typeof value === 'object' && 'listing_code' in value && value.listing_code)
+}
+
+function normalizePendingBookingResult(pendingBooking: PendingBooking): SearchResultItem {
+  const snapshot = pendingBooking.event_snapshot ?? {}
+  return {
+    id: pendingBooking.listing_code,
+    listing_code: pendingBooking.listing_code,
+    title: snapshot.title ?? 'Selected event',
+    city: snapshot.city ?? '',
+    venue_name: snapshot.venue_name ?? '',
+    event_date: snapshot.event_date ?? '',
+    start_at: snapshot.start_at ?? snapshot.event_date ?? '',
+    min_price: snapshot.min_price ?? undefined,
+    max_price: snapshot.max_price ?? undefined,
+    genres: snapshot.genres,
+    sport_type: snapshot.sport_type ?? undefined,
+  }
+}
+
+function getSelectedBookingResult(message: ThreadMessage): SearchResultItem | null {
+  if (!['selection_pending', 'awaiting_user_info'].includes(message.metadata.booking_action ?? '')) {
+    return null
+  }
+
+  const snapshot =
+    message.metadata.selected_event ??
+    message.metadata.pending_booking?.event_snapshot ??
+    null
+
+  if (!snapshot?.listing_code) {
+    return null
+  }
+
+  return {
+    id: snapshot.listing_code,
+    listing_code: snapshot.listing_code,
+    title: snapshot.title ?? 'Selected event',
+    city: snapshot.city ?? '',
+    venue_name: snapshot.venue_name ?? '',
+    event_date: snapshot.event_date ?? '',
+    start_at: snapshot.start_at ?? snapshot.event_date ?? '',
+    min_price: snapshot.min_price ?? undefined,
+    max_price: snapshot.max_price ?? undefined,
+    genres: snapshot.genres,
+    sport_type: snapshot.sport_type ?? undefined,
+  }
+}
+
+function formatAwaitingFieldLabel(fieldName: string | null | undefined) {
+  if (!fieldName) {
+    return null
+  }
+  if (fieldName === 'contact_number') {
+    return 'contact number'
+  }
+  return fieldName
 }
 
 function formatEventDateTime(eventDate: string, startAt: string) {
@@ -423,4 +527,11 @@ function formatEventDateTime(eventDate: string, startAt: string) {
     hour: 'numeric',
     minute: '2-digit',
   }).format(date)
+}
+
+function getGreeting() {
+  const hour = new Date().getHours()
+  if (hour < 12) return 'Good morning'
+  if (hour < 17) return 'Good afternoon'
+  return 'Good evening'
 }

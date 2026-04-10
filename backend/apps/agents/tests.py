@@ -13,7 +13,11 @@ from apps.agents.langchain_tools import (
 from apps.agents.schemas import ActiveFilters, BookingTurnResolution, CatalogInquiry, FilterResolution
 from apps.agents.services import ChatTurnError, _derive_filters_to_clear, process_chat_turn
 from apps.bookings.models import Booking
-from apps.bookings.services import confirm_thread_pending_booking, mark_thread_pending_booking
+from apps.bookings.services import (
+    attempt_thread_pending_booking_confirmation,
+    mark_thread_pending_booking,
+    save_thread_booking_user_info,
+)
 from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
 from apps.events.models import SportEvent
 from apps.events.services import SearchResult
@@ -131,6 +135,198 @@ class AgentServiceTests(TestCase):
 
     @patch("apps.agents.services.resolve_turn_filters")
     @patch("apps.agents.services.invoke_booking_agent")
+    def test_process_chat_turn_short_circuits_for_missing_booking_user_info(
+        self,
+        invoke_booking_agent_mock,
+        resolve_turn_filters_mock,
+    ):
+        thread = ChatThread.objects.create(title="Existing thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={"event_types": ["sports"]},
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "name",
+                "customer_info": {"name": "", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match"},
+            },
+        )
+        invoke_booking_agent_mock.return_value = BookingTurnResolution(
+            action="awaiting_user_info",
+            message="Please share your full name to complete the booking.",
+            listing_code="SPT-1",
+            requested_field="name",
+        )
+
+        payload = process_chat_turn(user_message="yes", thread_id=str(thread.id))
+
+        resolve_turn_filters_mock.assert_not_called()
+        self.assertEqual(payload["assistant_message"]["metadata"]["booking_action"], "awaiting_user_info")
+        self.assertEqual(payload["assistant_message"]["metadata"]["requested_field"], "name")
+
+    @patch("apps.agents.services.resolve_turn_filters")
+    @patch("apps.agents.services.invoke_booking_agent")
+    def test_process_chat_turn_repairs_invalid_booking_transition_before_confirmation(
+        self,
+        invoke_booking_agent_mock,
+        resolve_turn_filters_mock,
+    ):
+        thread = ChatThread.objects.create(title="Existing thread")
+        thread_filter = ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={"event_types": ["sports"]},
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["sports"],
+                "results": [
+                    {
+                        "position": 1,
+                        "domain": "sports",
+                        "listing_code": "SPT-1",
+                        "title": "Mumbai Match",
+                        "city": "Mumbai",
+                        "venue_name": "Wankhede Stadium",
+                        "event_date": "2026-04-12",
+                        "start_at": "2026-04-12T19:30:00+05:30",
+                    }
+                ],
+            },
+        )
+        def mutate_pending_booking(**_kwargs):
+            thread_filter.pending_booking = {
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "name",
+                "customer_info": {"name": "", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match"},
+            }
+            thread_filter.save(update_fields=["pending_booking", "updated_at"])
+            return BookingTurnResolution(
+                action="awaiting_user_info",
+                message="Please share your full name to complete the booking.",
+                listing_code="SPT-1",
+                requested_field="name",
+                selected_event={"listing_code": "SPT-1", "title": "Mumbai Match"},
+            )
+
+        invoke_booking_agent_mock.side_effect = mutate_pending_booking
+
+        payload = process_chat_turn(user_message="book the first one", thread_id=str(thread.id))
+
+        resolve_turn_filters_mock.assert_not_called()
+        self.assertEqual(payload["assistant_message"]["metadata"]["booking_action"], "awaiting_user_info")
+        thread_filter.refresh_from_db()
+        self.assertEqual(thread_filter.pending_booking["status"], "awaiting_user_info")
+        self.assertEqual(thread_filter.pending_booking["awaiting_field"], "name")
+
+    @patch("apps.agents.services.resolve_turn_filters")
+    @patch("apps.agents.services.invoke_booking_agent")
+    def test_process_chat_turn_returns_agent_requested_next_user_info_prompt(
+        self,
+        invoke_booking_agent_mock,
+        resolve_turn_filters_mock,
+    ):
+        thread = ChatThread.objects.create(title="Existing thread")
+        thread_filter = ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={"event_types": ["sports"]},
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "email",
+                "customer_info": {"name": "Nandan Kumar", "email": "", "contact_number": ""},
+                "event_snapshot": {
+                    "listing_code": "SPT-1",
+                    "title": "Mumbai Match",
+                    "city": "Mumbai",
+                    "venue_name": "Wankhede Stadium",
+                    "event_date": "2026-04-12",
+                    "start_at": "2026-04-12T19:30:00+05:30",
+                    "min_price": 499,
+                    "max_price": 2400,
+                    "domain": "sports",
+                },
+            },
+        )
+
+        def leave_pending_half_updated(**_kwargs):
+            thread_filter.pending_booking = {
+                **thread_filter.pending_booking,
+                "customer_info": {
+                    "name": "Nandan Kumar",
+                    "email": "nandan@example.com",
+                    "contact_number": "",
+                },
+                "awaiting_field": "contact_number",
+            }
+            thread_filter.save(update_fields=["pending_booking", "updated_at"])
+            return BookingTurnResolution(
+                action="awaiting_user_info",
+                message="Thanks, Nandan Kumar. Please provide your contact number to proceed with the booking.",
+                listing_code="SPT-1",
+                requested_field="contact_number",
+                selected_event={"listing_code": "SPT-1", "title": "Mumbai Match"},
+            )
+
+        invoke_booking_agent_mock.side_effect = leave_pending_half_updated
+
+        payload = process_chat_turn(user_message="nandan@example.com", thread_id=str(thread.id))
+
+        resolve_turn_filters_mock.assert_not_called()
+        self.assertEqual(payload["assistant_message"]["metadata"]["booking_action"], "awaiting_user_info")
+        self.assertEqual(payload["assistant_message"]["metadata"]["requested_field"], "contact_number")
+        thread_filter.refresh_from_db()
+        self.assertEqual(thread_filter.pending_booking["awaiting_field"], "contact_number")
+
+    @patch("apps.agents.services.resolve_turn_filters")
+    @patch("apps.agents.services.invoke_booking_agent")
+    def test_process_chat_turn_trusts_agent_when_same_user_info_prompt_repeats(
+        self,
+        invoke_booking_agent_mock,
+        resolve_turn_filters_mock,
+    ):
+        thread = ChatThread.objects.create(title="Existing thread")
+        thread_filter = ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={"event_types": ["sports"]},
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "email",
+                "customer_info": {"name": "Nandan Kumar", "email": "", "contact_number": ""},
+                "event_snapshot": {
+                    "listing_code": "SPT-1",
+                    "title": "Mumbai Match",
+                    "city": "Mumbai",
+                    "venue_name": "Wankhede Stadium",
+                    "event_date": "2026-04-12",
+                    "start_at": "2026-04-12T19:30:00+05:30",
+                    "min_price": 499,
+                    "max_price": 2400,
+                    "domain": "sports",
+                },
+            },
+        )
+        invoke_booking_agent_mock.return_value = BookingTurnResolution(
+            action="awaiting_user_info",
+            message="Please share your email address to complete the booking.",
+            listing_code="SPT-1",
+            requested_field="email",
+            selected_event={"listing_code": "SPT-1", "title": "Mumbai Match"},
+        )
+
+        payload = process_chat_turn(user_message="nandan@example.com", thread_id=str(thread.id))
+
+        resolve_turn_filters_mock.assert_not_called()
+        self.assertEqual(payload["assistant_message"]["metadata"]["booking_action"], "awaiting_user_info")
+        self.assertEqual(payload["assistant_message"]["metadata"]["requested_field"], "email")
+        thread_filter.refresh_from_db()
+        self.assertEqual(thread_filter.pending_booking["customer_info"]["email"], "")
+        self.assertEqual(thread_filter.pending_booking["awaiting_field"], "email")
+
+    @patch("apps.agents.services.resolve_turn_filters")
+    @patch("apps.agents.services.invoke_booking_agent")
     def test_process_chat_turn_returns_current_results_when_booking_is_cleared(
         self,
         invoke_booking_agent_mock,
@@ -219,8 +415,7 @@ class AgentServiceTests(TestCase):
             },
         )
         invoke_booking_agent_mock.return_value = BookingTurnResolution(
-            action="no_match",
-            message="No pending booking matches that request.",
+            action="none",
         )
         resolve_turn_filters_mock.return_value = TurnResolution(
             updates=ActiveFilters(sport_types=["Football"]),
@@ -229,7 +424,7 @@ class AgentServiceTests(TestCase):
 
         payload = process_chat_turn(user_message="show football instead", thread_id=str(thread.id))
 
-        resolve_turn_filters_mock.assert_called_once()
+        self.assertEqual(resolve_turn_filters_mock.call_count, 1)
         thread_filter.refresh_from_db()
         self.assertEqual(thread_filter.pending_booking, {})
         self.assertEqual(payload["active_filters"]["sport_types"], ["Football"])
@@ -271,10 +466,9 @@ class AgentServiceTests(TestCase):
             },
         )
         invoke_booking_agent_mock.return_value = BookingTurnResolution(
-            action="selection_pending",
-            message="I have selected 'Love and War' at PVR Phoenix for booking. Please confirm if you want to proceed.",
-            listing_code="MOV-011-02",
-            selected_event={"listing_code": "MOV-011-02", "title": "Love and War"},
+            action="ambiguous",
+            message="Multiple matching events are available at PVR Phoenix. Please tell me which one you want to book.",
+            candidates=["Love and War", "Kuberaa"],
         )
 
         payload = process_chat_turn(user_message="book the PVR Phoenix one", thread_id=str(thread.id))
@@ -286,7 +480,7 @@ class AgentServiceTests(TestCase):
 
     @patch("apps.agents.services.resolve_turn_filters")
     @patch("apps.agents.services.invoke_booking_agent")
-    def test_process_chat_turn_rescues_booking_selection_when_agent_returns_none(
+    def test_process_chat_turn_does_not_force_booking_selection_when_agent_returns_none(
         self,
         invoke_booking_agent_mock,
         resolve_turn_filters_mock,
@@ -312,12 +506,51 @@ class AgentServiceTests(TestCase):
             },
         )
         invoke_booking_agent_mock.return_value = BookingTurnResolution(action="none")
+        resolve_turn_filters_mock.return_value = TurnResolution(
+            updates=ActiveFilters(),
+            tool_trace=[],
+        )
 
         payload = process_chat_turn(user_message="book Love and War", thread_id=str(thread.id))
 
+        self.assertNotIn("booking_action", payload["assistant_message"]["metadata"])
+        self.assertEqual(payload["pending_booking"], {})
+        self.assertEqual(payload["search_domains"], ["movies"])
+
+    @patch("apps.agents.services.resolve_turn_filters")
+    @patch("apps.agents.services.invoke_booking_agent")
+    def test_process_chat_turn_relies_on_agent_for_user_info_booking_progression(
+        self,
+        invoke_booking_agent_mock,
+        resolve_turn_filters_mock,
+    ):
+        thread = ChatThread.objects.create(title="Existing thread")
+        thread_filter = ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={"event_types": ["sports"]},
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-BOOK-1",
+                "awaiting_field": "contact_number",
+                "customer_info": {
+                    "name": "Nandan Kumar",
+                    "email": "nandan@example.com",
+                    "contact_number": "",
+                },
+                "event_snapshot": {"listing_code": "SPT-BOOK-1", "title": "Mumbai Match"},
+            },
+        )
+        invoke_booking_agent_mock.return_value = BookingTurnResolution(
+            action="booking_confirmed",
+            message="Booking confirmed for Mumbai Match. Your reference is ATD-BOOK1234.",
+            listing_code="SPT-BOOK-1",
+            booking={"booking_reference": "ATD-BOOK1234"},
+        )
+
+        payload = process_chat_turn(user_message="+91 9876543210", thread_id=str(thread.id))
+
         resolve_turn_filters_mock.assert_not_called()
-        self.assertEqual(payload["assistant_message"]["metadata"]["booking_action"], "selection_pending")
-        self.assertEqual(payload["pending_booking"]["listing_code"], "MOV-011-02")
+        self.assertEqual(payload["assistant_message"]["metadata"]["booking_action"], "booking_confirmed")
 
     @patch("apps.agents.services.invoke_booking_agent", return_value=BookingTurnResolution(action="none"))
     @patch("apps.agents.services.resolve_turn_filters")
@@ -1012,16 +1245,26 @@ class BookingStateTests(TestCase):
         pending_booking = mark_thread_pending_booking(thread_filter=thread_filter, listing_code="SPT-BOOK-1")
         self.assertEqual(pending_booking["listing_code"], "SPT-BOOK-1")
 
-        booking, already_confirmed = confirm_thread_pending_booking(
+        first_attempt = attempt_thread_pending_booking_confirmation(
+            thread=thread,
+            thread_filter=thread_filter,
+            confirmed_via="test",
+            append_confirmation_message=False,
+        )
+        self.assertEqual(first_attempt["status"], "missing_user_info")
+        save_thread_booking_user_info(thread_filter=thread_filter, field_name="name", value="Nandan Kumar")
+        save_thread_booking_user_info(thread_filter=thread_filter, field_name="email", value="nandan@example.com")
+        save_thread_booking_user_info(thread_filter=thread_filter, field_name="contact_number", value="+91 9876543210")
+        final_attempt = attempt_thread_pending_booking_confirmation(
             thread=thread,
             thread_filter=thread_filter,
             confirmed_via="test",
             append_confirmation_message=False,
         )
 
-        self.assertFalse(already_confirmed)
         self.assertEqual(Booking.objects.count(), 1)
-        self.assertEqual(booking.event_title, "Royal Challengers Bengaluru vs Mumbai Indians")
+        self.assertEqual(final_attempt["status"], "confirmed")
+        self.assertEqual(Booking.objects.get().event_title, "Royal Challengers Bengaluru vs Mumbai Indians")
         thread_filter.refresh_from_db()
         self.assertEqual(thread_filter.pending_booking, {})
 

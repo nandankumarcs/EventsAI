@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from django.db.models import Max
 from django.utils import timezone
 
 from apps.agents.langchain_tools import ResolutionIssue, invoke_booking_agent, resolve_turn_filters
-from apps.agents.schemas import ActiveFilters, BookingTurnResolution
-from apps.bookings.services import build_latest_result_context, clear_thread_pending_booking
+from apps.agents.schemas import ActiveFilters
+from apps.bookings.services import build_latest_result_context
 from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
 from apps.events.services import diversify_sport_results, search_movie_events, search_sport_events
 
@@ -59,14 +58,19 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
     _assert_thread_accepts_messages(thread)
     thread_filter = _get_or_create_thread_filter(thread)
     current_filters = ActiveFilters.model_validate(thread_filter.active_filters or {})
+    pending_booking_before_turn = dict(thread_filter.pending_booking or {})
 
     _append_message(thread, role=ChatMessage.Role.USER, content=user_message, metadata={})
 
     booking_resolution = invoke_booking_agent(thread_id=str(thread.id), user_message=user_message)
+    thread_filter.refresh_from_db()
     booking_resolution = _reconcile_booking_resolution(
         user_message=user_message,
         booking_resolution=booking_resolution,
         thread_filter=thread_filter,
+        pending_booking_before_turn=pending_booking_before_turn,
+        current_filters=current_filters,
+        reference_date=reference_date,
     )
     if booking_resolution.action != "none":
         booking_results_by_domain = (
@@ -83,6 +87,7 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
             metadata={
                 "booking_action": booking_resolution.action,
                 "listing_code": booking_resolution.listing_code,
+                "requested_field": booking_resolution.requested_field,
                 "selected_event": booking_resolution.selected_event
                 or thread_filter.pending_booking.get("event_snapshot", {}),
                 "pending_booking": thread_filter.pending_booking,
@@ -215,179 +220,10 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
 
 def _reconcile_booking_resolution(
     *,
-    user_message: str,
     booking_resolution,
-    thread_filter: ThreadFilter,
+    **_: Any,
 ):
-    if booking_resolution.action == "none":
-        rescued_resolution = _rescue_booking_selection_from_result_context(
-            user_message=user_message,
-            thread_filter=thread_filter,
-        )
-        if rescued_resolution is not None:
-            return rescued_resolution
-
-    if booking_resolution.action == "no_match" and _should_fall_through_to_search(
-        user_message=user_message,
-        thread_filter=thread_filter,
-    ):
-        clear_thread_pending_booking(thread_filter=thread_filter)
-        return booking_resolution.model_copy(update={"action": "none", "message": ""})
-
-    if booking_resolution.action != "selection_pending":
-        return booking_resolution
-
-    result_context = thread_filter.latest_result_context or {}
-    candidate_results = _derive_booking_selection_candidates(
-        user_message=user_message,
-        results=result_context.get("results", []),
-    )
-    if not candidate_results:
-        return booking_resolution
-
-    if len(candidate_results) > 1:
-        clear_thread_pending_booking(thread_filter=thread_filter)
-        return booking_resolution.model_copy(
-            update={
-                "action": "ambiguous",
-                "message": (
-                    f"I found multiple matching events in the current results: "
-                    f"{', '.join(_format_booking_candidate_label(item) for item in candidate_results[:3])}. "
-                    "Please tell me which one you want to book."
-                ),
-                "listing_code": "",
-                "selected_event": {},
-                "candidates": [_format_booking_candidate_label(item) for item in candidate_results[:5]],
-            }
-        )
-
-    chosen_candidate = candidate_results[0]
-    if chosen_candidate.get("listing_code") == booking_resolution.listing_code:
-        return booking_resolution
-
-    thread_filter.pending_booking = {
-        "status": "pending_confirmation",
-        "listing_code": chosen_candidate["listing_code"],
-        "event_snapshot": chosen_candidate,
-        "selected_at": timezone.now().isoformat(),
-    }
-    thread_filter.save(update_fields=["pending_booking", "updated_at"])
-    return booking_resolution.model_copy(
-        update={
-            "listing_code": chosen_candidate["listing_code"],
-            "selected_event": chosen_candidate,
-        }
-    )
-
-
-def _should_fall_through_to_search(*, user_message: str, thread_filter: ThreadFilter) -> bool:
-    if not thread_filter.pending_booking:
-        return False
-    message = user_message.strip().lower()
-    if not message:
-        return False
-
-    booking_verbs = ("book", "reserve")
-    confirmation_terms = ("yes", "confirm", "go ahead", "proceed", "do it", "this one")
-    rejection_terms = ("no", "cancel", "not this one", "don't")
-    return not any(term in message for term in (*booking_verbs, *confirmation_terms, *rejection_terms))
-
-
-def _rescue_booking_selection_from_result_context(
-    *,
-    user_message: str,
-    thread_filter: ThreadFilter,
-):
-    if not _looks_like_booking_selection(user_message):
-        return None
-
-    results = (thread_filter.latest_result_context or {}).get("results", [])
-    candidate_results = _derive_booking_selection_candidates(user_message=user_message, results=results)
-    if not candidate_results:
-        return None
-
-    if len(candidate_results) > 1:
-        clear_thread_pending_booking(thread_filter=thread_filter)
-        return BookingTurnResolution(
-            action="ambiguous",
-            message=(
-                f"I found multiple matching events in the current results: "
-                f"{', '.join(_format_booking_candidate_label(item) for item in candidate_results[:3])}. "
-                "Please tell me which one you want to book."
-            ),
-            candidates=[_format_booking_candidate_label(item) for item in candidate_results[:5]],
-        )
-
-    chosen_candidate = candidate_results[0]
-    thread_filter.pending_booking = {
-        "status": "pending_confirmation",
-        "listing_code": chosen_candidate["listing_code"],
-        "event_snapshot": chosen_candidate,
-        "selected_at": timezone.now().isoformat(),
-    }
-    thread_filter.save(update_fields=["pending_booking", "updated_at"])
-    return BookingTurnResolution(
-        action="selection_pending",
-        message=f"I have selected '{chosen_candidate.get('title', 'that event')}' for booking. Please confirm if you want to proceed.",
-        listing_code=chosen_candidate["listing_code"],
-        selected_event=chosen_candidate,
-    )
-
-
-def _looks_like_booking_selection(user_message: str) -> bool:
-    message = user_message.strip().lower()
-    if not message:
-        return False
-    return any(term in message for term in ("book", "reserve"))
-
-
-def _derive_booking_selection_candidates(*, user_message: str, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not results:
-        return []
-
-    message = user_message.strip().lower()
-    if not message or "book" not in message:
-        return []
-
-    ordinal_match = re.search(r"\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|last)\b", message)
-    if ordinal_match:
-        ordinal = ordinal_match.group(1)
-        position_map = {
-            "first": 1,
-            "1st": 1,
-            "second": 2,
-            "2nd": 2,
-            "third": 3,
-            "3rd": 3,
-            "fourth": 4,
-            "4th": 4,
-            "fifth": 5,
-            "5th": 5,
-            "last": len(results),
-        }
-        position = position_map.get(ordinal)
-        return [item for item in results if item.get("position") == position]
-
-    matches: list[dict[str, Any]] = []
-    for item in results:
-        for field_name in ("title", "venue_name", "city"):
-            value = (item.get(field_name) or "").strip().lower()
-            if value and value in message:
-                matches.append(item)
-                break
-    deduped: dict[str, dict[str, Any]] = {item["listing_code"]: item for item in matches}
-    return list(deduped.values())
-
-
-def _format_booking_candidate_label(item: dict[str, Any]) -> str:
-    title = item.get("title", "event")
-    venue_name = item.get("venue_name", "")
-    city = item.get("city", "")
-    if venue_name and city:
-        return f"{title} at {venue_name}, {city}"
-    if city:
-        return f"{title} in {city}"
-    return title
+    return booking_resolution
 
 
 def _results_by_domain_from_latest_context(latest_result_context: dict[str, Any] | None) -> dict[str, dict[str, Any]]:

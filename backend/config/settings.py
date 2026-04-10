@@ -7,6 +7,9 @@ from dotenv import load_dotenv
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Path to the compiled React frontend (../frontend/dist)
+FRONTEND_DIR = BASE_DIR.parent / "frontend" / "dist"
+
 load_dotenv(BASE_DIR / ".env")
 
 
@@ -25,6 +28,12 @@ def get_list(name: str, default: str) -> list[str]:
 DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
 OPENAI_RESOLVER_MODEL = os.getenv("OPENAI_RESOLVER_MODEL", "gpt-4.1-mini")
+DB_CONN_MAX_AGE = int(os.getenv("DB_CONN_MAX_AGE", "0" if get_bool("DJANGO_DEBUG", True) else "600"))
+
+# Ollama configuration (for local Gemma 4)
+USE_OLLAMA = get_bool("USE_OLLAMA", False)
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e2b")
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-attend-secret-key")
 DEBUG = get_bool("DJANGO_DEBUG", True)
@@ -70,7 +79,8 @@ ROOT_URLCONF = "config.urls"
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [],
+        # Serve index.html from the React build directory
+        "DIRS": [FRONTEND_DIR],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -91,7 +101,7 @@ if DATABASE_URL:
         "default": dj_database_url.parse(
             DATABASE_URL,
             conn_health_checks=True,
-            conn_max_age=600,
+            conn_max_age=DB_CONN_MAX_AGE,
         )
     }
 else:
@@ -132,7 +142,11 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
-STATIC_URL = "static/"
+# Serve the Vite-compiled assets under /assets/
+STATIC_URL = "/assets/"
+STATICFILES_DIRS = [FRONTEND_DIR / "assets"]
+# collectstatic destination (for production deployments)
+STATIC_ROOT = BASE_DIR / "staticfiles"
 
 # Default primary key field type
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

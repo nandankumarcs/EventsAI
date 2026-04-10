@@ -30,6 +30,34 @@ export type SearchResultItem = {
   away_team?: string
 }
 
+export type ResultContextItem = {
+  position: number
+  domain: 'movies' | 'sports' | string
+  listing_code: string
+  title: string
+  city: string
+  venue_name: string
+  event_date: string
+  start_at: string
+  min_price?: number | null
+  max_price?: number | null
+  sport_type?: string | null
+  genres?: string[]
+}
+
+export type PendingBooking = {
+  status: string
+  listing_code: string
+  selected_at?: string
+  awaiting_field?: string | null
+  customer_info?: {
+    name?: string
+    email?: string
+    contact_number?: string
+  }
+  event_snapshot?: Partial<ResultContextItem>
+}
+
 export type SearchDomainResult = {
   count: number
   limit: number
@@ -58,6 +86,11 @@ export type ThreadMessage = {
     result_listing_codes?: string[]
     results_by_domain?: SearchResultsByDomain
     active_filters?: ActiveFilters
+    pending_booking?: PendingBooking
+    booking_action?: string
+    requested_field?: string
+    selected_event?: Partial<ResultContextItem>
+    booking?: BookingSummary
   }
   created_at: string
 }
@@ -71,6 +104,13 @@ export type ThreadSummary = {
   last_activity_at: string
   message_count: number
   active_filters: ActiveFilters
+  latest_result_context: {
+    thread_id?: string
+    captured_at?: string
+    search_domains?: string[]
+    results?: ResultContextItem[]
+  }
+  pending_booking: PendingBooking | Record<string, never>
 }
 
 export type ThreadDetail = ThreadSummary & {
@@ -81,6 +121,7 @@ export type ThreadDetail = ThreadSummary & {
 
 export type ThreadListResponse = {
   count: number
+  has_more: boolean
   threads: ThreadSummary[]
 }
 
@@ -105,6 +146,8 @@ export type ChatTurnResponse = {
   active_filters: ActiveFilters
   search_domains: string[]
   results_by_domain: SearchResultsByDomain
+  latest_result_context: ThreadSummary['latest_result_context']
+  pending_booking: ThreadSummary['pending_booking']
   needs_clarification: boolean
   clarification_question: string | null
 }
@@ -116,6 +159,9 @@ export type BookingSummary = {
   event_type: string
   status: string
   event_title: string
+  customer_name: string
+  customer_email: string
+  customer_contact_number: string
   city: string
   venue_name: string
   starts_at: string
@@ -159,8 +205,12 @@ export async function fetchHealth() {
   return request<HealthResponse>('/api/health/')
 }
 
-export async function listThreads() {
-  return request<ThreadListResponse>('/api/chats/threads/')
+export async function listThreads(limit = 20, offset = 0) {
+  const query = new URLSearchParams({
+    limit: limit.toString(),
+    offset: offset.toString(),
+  })
+  return request<ThreadListResponse>(`/api/chats/threads/?${query}`)
 }
 
 export async function createThread(title?: string) {

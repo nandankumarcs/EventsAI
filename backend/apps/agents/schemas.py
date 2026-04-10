@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -61,6 +62,24 @@ class SearchSummary(BaseModel):
     count: int
     listing_codes: list[str] = Field(default_factory=list)
     result_titles: list[str] = Field(default_factory=list)
+
+
+class BookingTurnResolution(BaseModel):
+    action: Literal[
+        "none",
+        "selection_pending",
+        "awaiting_user_info",
+        "booking_confirmed",
+        "booking_cleared",
+        "ambiguous",
+        "no_match",
+    ] = "none"
+    message: str = ""
+    listing_code: str = ""
+    requested_field: str = ""
+    selected_event: dict[str, Any] = Field(default_factory=dict)
+    booking: dict[str, Any] = Field(default_factory=dict)
+    candidates: list[str] = Field(default_factory=list)
 
 
 class TurnUpdate(BaseModel):

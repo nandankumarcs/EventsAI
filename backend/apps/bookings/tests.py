@@ -5,6 +5,11 @@ from django.test import TestCase
 from django.utils import timezone
 
 from apps.bookings.models import Booking
+from apps.bookings.services import (
+    attempt_thread_pending_booking_confirmation,
+    mark_thread_pending_booking,
+    save_thread_booking_user_info,
+)
 from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
 from apps.events.models import MovieEvent
 
@@ -121,3 +126,97 @@ class BookingApiTests(TestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertIn("already has a confirmed booking", response.json()["error"])
+
+    def test_attempt_pending_booking_confirmation_collects_required_user_info_before_booking(self):
+        thread = ChatThread.objects.create(title="Chat booking")
+        thread_filter = ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={"event_types": ["movies"], "cities": ["Mumbai"]},
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["movies"],
+                "results": [
+                    {
+                        "position": 1,
+                        "domain": "movies",
+                        "listing_code": self.movie_event.listing_code,
+                        "title": self.movie_event.title,
+                        "city": self.movie_event.city,
+                        "venue_name": self.movie_event.venue_name,
+                        "event_date": self.movie_event.event_date.isoformat(),
+                        "start_at": self.movie_event.start_at.isoformat(),
+                        "min_price": self.movie_event.min_price,
+                        "max_price": self.movie_event.max_price,
+                        "genres": self.movie_event.genres,
+                    }
+                ],
+            },
+        )
+
+        mark_thread_pending_booking(thread_filter=thread_filter, listing_code=self.movie_event.listing_code)
+
+        first_attempt = attempt_thread_pending_booking_confirmation(
+            thread=thread,
+            thread_filter=thread_filter,
+            confirmed_via="chat_message",
+            append_confirmation_message=False,
+        )
+        self.assertEqual(first_attempt["status"], "missing_user_info")
+        self.assertEqual(first_attempt["next_required_field"], "name")
+
+        save_thread_booking_user_info(thread_filter=thread_filter, field_name="name", value="Nandan Kumar")
+        second_attempt = attempt_thread_pending_booking_confirmation(
+            thread=thread,
+            thread_filter=thread_filter,
+            confirmed_via="chat_message",
+            append_confirmation_message=False,
+        )
+        self.assertEqual(second_attempt["next_required_field"], "email")
+
+        save_thread_booking_user_info(thread_filter=thread_filter, field_name="email", value="nandan@example.com")
+        third_attempt = attempt_thread_pending_booking_confirmation(
+            thread=thread,
+            thread_filter=thread_filter,
+            confirmed_via="chat_message",
+            append_confirmation_message=False,
+        )
+        self.assertEqual(third_attempt["next_required_field"], "contact_number")
+
+        save_thread_booking_user_info(thread_filter=thread_filter, field_name="contact_number", value="+91 9876543210")
+        final_attempt = attempt_thread_pending_booking_confirmation(
+            thread=thread,
+            thread_filter=thread_filter,
+            confirmed_via="chat_message",
+            append_confirmation_message=False,
+        )
+        self.assertEqual(final_attempt["status"], "confirmed")
+        booking = Booking.objects.get()
+        self.assertEqual(booking.customer_name, "Nandan Kumar")
+        self.assertEqual(booking.customer_email, "nandan@example.com")
+        self.assertEqual(booking.customer_contact_number, "+91 9876543210")
+
+    def test_save_thread_booking_user_info_rejects_invalid_email(self):
+        thread = ChatThread.objects.create(title="Chat booking")
+        thread_filter = ThreadFilter.objects.create(
+            thread=thread,
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["movies"],
+                "results": [
+                    {
+                        "position": 1,
+                        "domain": "movies",
+                        "listing_code": self.movie_event.listing_code,
+                        "title": self.movie_event.title,
+                        "city": self.movie_event.city,
+                        "venue_name": self.movie_event.venue_name,
+                        "event_date": self.movie_event.event_date.isoformat(),
+                        "start_at": self.movie_event.start_at.isoformat(),
+                    }
+                ],
+            },
+        )
+        mark_thread_pending_booking(thread_filter=thread_filter, listing_code=self.movie_event.listing_code)
+
+        with self.assertRaisesMessage(Exception, "valid email address"):
+            save_thread_booking_user_info(thread_filter=thread_filter, field_name="email", value="not-an-email")

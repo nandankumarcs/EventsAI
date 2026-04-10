@@ -14,7 +14,7 @@ export function ThreadFiltersPanel({ thread }: ThreadFiltersPanelProps) {
   return (
     <aside className="hidden h-full min-h-0 w-80 shrink-0 border-l border-border/70 bg-background/50 xl:block">
       <div className="flex h-full flex-col">
-        <div className="sticky top-0 z-10 border-b border-border/70 bg-background/95 px-5 py-5 backdrop-blur">
+        <div className="sticky top-0 z-10 border-b border-border/70 bg-background/95 p-6 pr-8 backdrop-blur">
           <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-primary">
             <Eye className="size-4" />
             Live filters
@@ -25,7 +25,7 @@ export function ThreadFiltersPanel({ thread }: ThreadFiltersPanelProps) {
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-5 space-y-4">
+        <div className="flex-1 overflow-y-auto p-6 pr-8 space-y-4">
           {thread ? (
             <div className="rounded-[16px] border border-border/70 bg-background p-4">
               <p className="text-sm font-semibold text-foreground">{thread.title}</p>

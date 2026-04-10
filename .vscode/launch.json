@@ -2,46 +2,25 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Backend: Django",
+      "name": "Python: Backend Current File",
       "type": "debugpy",
       "request": "launch",
-      "python": "${workspaceFolder}/backend/.venv/bin/python",
-      "program": "${workspaceFolder}/backend/manage.py",
-      "args": [
-        "runserver",
-        "127.0.0.1:8000"
-      ],
-      "django": true,
-      "justMyCode": false,
+      "program": "${file}",
       "cwd": "${workspaceFolder}/backend",
-      "envFile": "${workspaceFolder}/backend/.env",
-      "console": "integratedTerminal"
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/backend/.venv/bin/python"
     },
     {
-      "name": "Frontend: Vite dev server",
-      "type": "node-terminal",
+      "name": "Python: Backend Unittest Current File",
+      "type": "debugpy",
       "request": "launch",
-      "command": "npm run dev -- --host 127.0.0.1 --port 5173",
-      "cwd": "${workspaceFolder}/frontend"
-    },
-    {
-      "name": "Frontend: Chrome",
-      "type": "pwa-chrome",
-      "request": "launch",
-      "url": "http://127.0.0.1:5173",
-      "webRoot": "${workspaceFolder}/frontend",
-      "sourceMaps": true
-    }
-  ],
-  "compounds": [
-    {
-      "name": "App: Full stack",
-      "configurations": [
-        "Backend: Django",
-        "Frontend: Vite dev server",
-        "Frontend: Chrome"
+      "module": "unittest",
+      "args": [
+        "${file}"
       ],
-      "stopAll": true
+      "cwd": "${workspaceFolder}/backend",
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/backend/.venv/bin/python"
     }
   ]
 }

@@ -1,6 +1,6 @@
-# Attend MVP
+# Events AI
 
-Attend is a chat-first event discovery and booking MVP inspired by the filter flow of booking platforms like BookMyShow. Instead of clicking filters, users describe what they want in natural language and the system builds a persisted filter state per thread.
+EventsAI is a chat-first event discovery and booking platform inspired by the filter flow of booking platforms like BookMyShow. Instead of clicking filters, users describe what they want in natural language and the system builds a persisted filter state per thread.
 
 The current MVP supports:
 
@@ -35,6 +35,8 @@ The current MVP supports:
 │   │   ├── components
 │   │   └── lib
 │   └── package.json
+├── start.sh                       # unified build + run script
+├── Makefile                       # convenience wrapper for start.sh
 └── PHASEWISE_IMPLEMENTATION_PLAN.md
 ```
 
@@ -65,25 +67,22 @@ VITE_API_BASE_URL=http://127.0.0.1:8000
 
 ## Local Run
 
-### 1. Backend
-
-Create a virtual environment, install dependencies, then run migrations:
+### One-time setup
 
 ```bash
+# Backend — create venv and install Python deps
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python manage.py migrate
+cd ..
+
+# Frontend — install Node deps
+cd frontend && npm install && cd ..
 ```
 
-Start the API server:
-
-```bash
-python manage.py runserver 127.0.0.1:8000
-```
-
-### 2. Seed data
+### Seed data
 
 The seed command resets and repopulates movie and sport catalog data with future-only events:
 
@@ -92,17 +91,31 @@ cd backend
 .venv/bin/python manage.py seed_event_data --reset
 ```
 
-### 3. Frontend
+### Start (unified command)
 
-Install dependencies and start the Vite app:
+From the **project root**, run either of the following — they are equivalent:
 
 ```bash
-cd frontend
-npm install
-npm run dev -- --host 127.0.0.1 --port 4173
+./start.sh
+# or
+make start
 ```
 
-Open [http://127.0.0.1:4173](http://127.0.0.1:4173).
+This will:
+1. Build the React frontend (`npm run build` → `frontend/dist/`)
+2. Start the Django server at **http://127.0.0.1:8000**
+
+The server now serves both the API (`/api/*`) and the compiled React SPA from a single origin. No separate frontend dev server is needed.
+
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
+
+### Running backend only (no frontend rebuild)
+
+```bash
+make runserver
+# or
+cd backend && .venv/bin/python manage.py runserver
+```
 
 ## Core API Endpoints
 

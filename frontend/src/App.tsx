@@ -12,6 +12,7 @@ import {
   sendChatMessage,
   type HealthResponse,
   type ThreadDetail,
+  type ThreadMessage,
   type ThreadSummary,
 } from '@/lib/api'
 
@@ -20,10 +21,13 @@ function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>([])
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null)
   const [selectedThread, setSelectedThread] = useState<ThreadDetail | null>(null)
-  const [health, setHealth] = useState<HealthResponse | null>(null)
+  const [, setHealth] = useState<HealthResponse | null>(null)
   const [healthError, setHealthError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [threadsLoading, setThreadsLoading] = useState(true)
+  const [threadsOffset, setThreadsOffset] = useState(0)
+  const [hasMoreThreads, setHasMoreThreads] = useState(false)
+  const [isLoadingMoreThreads, setIsLoadingMoreThreads] = useState(false)
   const [threadLoading, setThreadLoading] = useState(false)
   const [sending, setSending] = useState(false)
   const [creatingThread, setCreatingThread] = useState(false)
@@ -39,13 +43,15 @@ function App() {
       setHealthError(null)
 
       try {
-        const [nextHealth, threadPayload] = await Promise.all([fetchHealth(), listThreads()])
+        const [nextHealth, threadPayload] = await Promise.all([fetchHealth(), listThreads(20, 0)])
         if (cancelled) {
           return
         }
 
         setHealth(nextHealth)
         setThreads(threadPayload.threads)
+        setThreadsOffset(0)
+        setHasMoreThreads(threadPayload.has_more)
 
         const firstThread = threadPayload.threads[0]
         if (firstThread) {
@@ -127,10 +133,12 @@ function App() {
     setHealthError(null)
 
     try {
-      const [nextHealth, threadPayload] = await Promise.all([fetchHealth(), listThreads()])
+      const [nextHealth, threadPayload] = await Promise.all([fetchHealth(), listThreads(20, 0)])
 
       setHealth(nextHealth)
       setThreads(threadPayload.threads)
+      setThreadsOffset(0)
+      setHasMoreThreads(threadPayload.has_more)
 
       const firstThread = threadPayload.threads[0]
       if (firstThread) {
@@ -148,8 +156,10 @@ function App() {
   }
 
   async function refreshThreads(preferredThreadId?: string) {
-    const payload = await listThreads()
+    const payload = await listThreads(20, 0)
     setThreads(payload.threads)
+    setThreadsOffset(0)
+    setHasMoreThreads(payload.has_more)
 
     const preferred =
       payload.threads.find((thread) => thread.id === preferredThreadId) ??
@@ -185,6 +195,31 @@ function App() {
     } finally {
       setThreadLoading(false)
       setThreadsLoading(false)
+    }
+  }
+
+  async function loadMoreThreads() {
+    if (!hasMoreThreads || isLoadingMoreThreads) {
+      return
+    }
+
+    setIsLoadingMoreThreads(true)
+    try {
+      const nextOffset = threadsOffset + 20
+      const payload = await listThreads(20, nextOffset)
+      
+      setThreads((prev) => {
+        // Simple deduplication based on ID
+        const currentIds = new Set(prev.map(t => t.id))
+        const newThreads = payload.threads.filter(t => !currentIds.has(t.id))
+        return [...prev, ...newThreads]
+      })
+      setThreadsOffset(nextOffset)
+      setHasMoreThreads(payload.has_more)
+    } catch {
+      // Fail silently for load more, or handle minimal error
+    } finally {
+      setIsLoadingMoreThreads(false)
     }
   }
 
@@ -226,20 +261,49 @@ function App() {
       return
     }
 
+    const optimisticMessage: ThreadMessage = {
+      id: `opt-${Date.now()}`,
+      position: (selectedThread?.messages.length ?? 0) + 1,
+      role: 'user',
+      content: message,
+      tool_name: '',
+      metadata: {},
+      created_at: new Date().toISOString(),
+    }
+
+    if (selectedThread) {
+      setSelectedThread({
+        ...selectedThread,
+        messages: [...selectedThread.messages, optimisticMessage],
+      })
+    }
+
     setSending(true)
+    setDraft('')
     setActionError(null)
     clearActionRetry()
 
     try {
       const payload = await sendChatMessage(message, selectedThreadId ?? undefined)
-      setDraft('')
       const nextThreadId = payload.thread.id
       await refreshThreads(nextThreadId)
       await loadThread(nextThreadId, { silent: true })
       clearActionRetry()
     } catch (error) {
+      setDraft(message) // Revert draft on error
+      if (selectedThread) {
+        // Revert optimistic message
+        setSelectedThread((prev) =>
+          prev
+            ? { ...prev, messages: prev.messages.filter((m) => m.id !== optimisticMessage.id) }
+            : prev,
+        )
+      }
       setActionError(error instanceof Error ? error.message : 'Unable to send message.')
-      registerActionRetry('Retry sending message', handleSend)
+      registerActionRetry('Retry sending message', () => {
+        setDraft(message)
+        void handleSend()
+      })
     } finally {
       setSending(false)
     }
@@ -280,12 +344,15 @@ function App() {
 
   return (
     <div className="flex h-screen w-full flex-col overflow-hidden bg-background">
-      <div className="grid h-full min-h-0 flex-1 lg:grid-cols-[280px_minmax(0,1fr)] xl:grid-cols-[280px_minmax(0,1fr)_300px]">
+      <div className="grid h-full min-h-0 flex-1 lg:grid-cols-[280px_minmax(0,1fr)] xl:grid-cols-[280px_minmax(0,1fr)_320px]">
         <ThreadSidebar
           threads={threads}
           selectedThreadId={selectedThreadId}
           isLoading={threadsLoading}
           isCreating={creatingThread}
+          hasMore={hasMoreThreads}
+          isLoadingMore={isLoadingMoreThreads}
+          onLoadMore={loadMoreThreads}
           onCreateThread={handleCreateThread}
           onSelectThread={handleSelectThread}
         />
@@ -295,7 +362,6 @@ function App() {
           sending={sending}
           bookingListingCode={bookingListingCode}
           loadingThread={threadLoading}
-          health={health}
           healthError={healthError}
           actionError={actionError}
           actionRetryLabel={actionRetryLabel}

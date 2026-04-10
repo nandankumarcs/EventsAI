@@ -67,6 +67,8 @@ class ThreadFilter(UUIDTimeStampedModel):
         related_name="filter_state",
     )
     active_filters = models.JSONField(default=dict, blank=True)
+    latest_result_context = models.JSONField(default=dict, blank=True)
+    pending_booking = models.JSONField(default=dict, blank=True)
     resolver_trace = models.JSONField(default=list, blank=True)
     version = models.PositiveIntegerField(default=1)
     last_resolved_at = models.DateTimeField(null=True, blank=True)

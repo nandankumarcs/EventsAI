@@ -11,11 +11,20 @@ from apps.chats.models import ChatThread, ThreadFilter
 @csrf_exempt
 def thread_list_create_view(request: HttpRequest) -> JsonResponse:
     if request.method == "GET":
-        threads = [
-            _serialize_thread_summary(thread)
-            for thread in ChatThread.objects.select_related("filter_state").prefetch_related("messages")
-        ]
-        return JsonResponse({"count": len(threads), "threads": threads})
+        try:
+            limit = int(request.GET.get("limit", 20))
+            offset = int(request.GET.get("offset", 0))
+        except ValueError:
+            return JsonResponse({"error": "Invalid pagination parameters"}, status=400)
+
+        queryset = ChatThread.objects.select_related("filter_state").prefetch_related("messages").order_by("-last_activity_at")
+        total_count = queryset.count()
+        subset = queryset[offset : offset + limit]
+
+        threads = [_serialize_thread_summary(thread) for thread in subset]
+        has_more = offset + limit < total_count
+
+        return JsonResponse({"count": total_count, "has_more": has_more, "threads": threads})
 
     if request.method != "POST":
         return HttpResponseNotAllowed(["GET", "POST"])
@@ -47,6 +56,7 @@ def thread_detail_view(request: HttpRequest, thread_id) -> JsonResponse:
 
 
 def _serialize_thread_summary(thread: ChatThread) -> dict[str, object]:
+    filter_state = getattr(thread, "filter_state", None)
     return {
         "id": str(thread.id),
         "title": thread.title,
@@ -55,7 +65,9 @@ def _serialize_thread_summary(thread: ChatThread) -> dict[str, object]:
         "last_message_preview": thread.last_message_preview,
         "last_activity_at": thread.last_activity_at.isoformat(),
         "message_count": thread.messages.count(),
-        "active_filters": getattr(getattr(thread, "filter_state", None), "active_filters", {}),
+        "active_filters": getattr(filter_state, "active_filters", {}),
+        "latest_result_context": getattr(filter_state, "latest_result_context", {}),
+        "pending_booking": getattr(filter_state, "pending_booking", {}),
     }
 
 

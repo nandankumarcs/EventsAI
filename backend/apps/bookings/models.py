@@ -40,6 +40,9 @@ class Booking(UUIDTimeStampedModel):
         blank=True,
     )
     event_title = models.CharField(max_length=255)
+    customer_name = models.CharField(max_length=255, blank=True)
+    customer_email = models.EmailField(blank=True)
+    customer_contact_number = models.CharField(max_length=32, blank=True)
     city = models.CharField(max_length=120)
     venue_name = models.CharField(max_length=255)
     starts_at = models.DateTimeField()
