@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from django.db.models import Max
 from django.utils import timezone
 
-from apps.agents.langchain_tools import ResolutionIssue, resolve_turn_filters
-from apps.agents.schemas import ActiveFilters
+from apps.agents.langchain_tools import ResolutionIssue, invoke_booking_agent, resolve_turn_filters
+from apps.agents.schemas import ActiveFilters, BookingTurnResolution
+from apps.bookings.services import build_latest_result_context, clear_thread_pending_booking
 from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
 from apps.events.services import diversify_sport_results, search_movie_events, search_sport_events
 
@@ -60,6 +62,51 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
 
     _append_message(thread, role=ChatMessage.Role.USER, content=user_message, metadata={})
 
+    booking_resolution = invoke_booking_agent(thread_id=str(thread.id), user_message=user_message)
+    booking_resolution = _reconcile_booking_resolution(
+        user_message=user_message,
+        booking_resolution=booking_resolution,
+        thread_filter=thread_filter,
+    )
+    if booking_resolution.action != "none":
+        booking_results_by_domain = (
+            _results_by_domain_from_latest_context(thread_filter.latest_result_context)
+            if booking_resolution.action == "booking_cleared"
+            else {}
+        )
+        thread.refresh_from_db()
+        thread_filter.refresh_from_db()
+        assistant_message = _append_message(
+            thread,
+            role=ChatMessage.Role.ASSISTANT,
+            content=booking_resolution.message,
+            metadata={
+                "booking_action": booking_resolution.action,
+                "listing_code": booking_resolution.listing_code,
+                "selected_event": booking_resolution.selected_event
+                or thread_filter.pending_booking.get("event_snapshot", {}),
+                "pending_booking": thread_filter.pending_booking,
+                "booking": booking_resolution.booking,
+                "candidates": booking_resolution.candidates,
+                "results_by_domain": booking_results_by_domain,
+                "latest_result_context": thread_filter.latest_result_context,
+            },
+        )
+        thread.last_message_preview = booking_resolution.message[:500]
+        thread.last_activity_at = timezone.now()
+        thread.save(update_fields=["last_message_preview", "last_activity_at", "updated_at"])
+        return {
+            "thread": _serialize_thread(thread),
+            "assistant_message": _serialize_message(assistant_message),
+            "active_filters": thread_filter.active_filters,
+            "latest_result_context": thread_filter.latest_result_context,
+            "pending_booking": thread_filter.pending_booking,
+            "search_domains": [],
+            "results_by_domain": booking_results_by_domain,
+            "needs_clarification": booking_resolution.action in {"ambiguous", "no_match"},
+            "clarification_question": booking_resolution.message if booking_resolution.action in {"ambiguous", "no_match"} else None,
+        }
+
     turn_resolution = resolve_turn_filters(
         current_filters=current_filters,
         user_message=user_message,
@@ -101,10 +148,26 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
         )
 
     thread_filter.active_filters = _compact_filter_state(merged_filters.model_dump())
+    thread_filter.latest_result_context = build_latest_result_context(
+        thread=thread,
+        search_domains=search_domains,
+        results_by_domain=results_by_domain,
+    )
+    thread_filter.pending_booking = {}
     thread_filter.resolver_trace = turn_resolution.tool_trace
     thread_filter.version += 1
     thread_filter.last_resolved_at = timezone.now()
-    thread_filter.save(update_fields=["active_filters", "resolver_trace", "version", "last_resolved_at", "updated_at"])
+    thread_filter.save(
+        update_fields=[
+            "active_filters",
+            "latest_result_context",
+            "pending_booking",
+            "resolver_trace",
+            "version",
+            "last_resolved_at",
+            "updated_at",
+        ]
+    )
 
     assistant_metadata = {
         "needs_clarification": needs_clarification,
@@ -113,6 +176,8 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
         "result_listing_codes": result_listing_codes,
         "results_by_domain": results_by_domain,
         "active_filters": thread_filter.active_filters,
+        "latest_result_context": thread_filter.latest_result_context,
+        "pending_booking": thread_filter.pending_booking,
         "resolution_issues": [
             {
                 "status": issue.status,
@@ -141,8 +206,224 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
         "active_filters": thread_filter.active_filters,
         "search_domains": search_domains,
         "results_by_domain": results_by_domain,
+        "latest_result_context": thread_filter.latest_result_context,
+        "pending_booking": thread_filter.pending_booking,
         "needs_clarification": needs_clarification,
         "clarification_question": clarification_question,
+    }
+
+
+def _reconcile_booking_resolution(
+    *,
+    user_message: str,
+    booking_resolution,
+    thread_filter: ThreadFilter,
+):
+    if booking_resolution.action == "none":
+        rescued_resolution = _rescue_booking_selection_from_result_context(
+            user_message=user_message,
+            thread_filter=thread_filter,
+        )
+        if rescued_resolution is not None:
+            return rescued_resolution
+
+    if booking_resolution.action == "no_match" and _should_fall_through_to_search(
+        user_message=user_message,
+        thread_filter=thread_filter,
+    ):
+        clear_thread_pending_booking(thread_filter=thread_filter)
+        return booking_resolution.model_copy(update={"action": "none", "message": ""})
+
+    if booking_resolution.action != "selection_pending":
+        return booking_resolution
+
+    result_context = thread_filter.latest_result_context or {}
+    candidate_results = _derive_booking_selection_candidates(
+        user_message=user_message,
+        results=result_context.get("results", []),
+    )
+    if not candidate_results:
+        return booking_resolution
+
+    if len(candidate_results) > 1:
+        clear_thread_pending_booking(thread_filter=thread_filter)
+        return booking_resolution.model_copy(
+            update={
+                "action": "ambiguous",
+                "message": (
+                    f"I found multiple matching events in the current results: "
+                    f"{', '.join(_format_booking_candidate_label(item) for item in candidate_results[:3])}. "
+                    "Please tell me which one you want to book."
+                ),
+                "listing_code": "",
+                "selected_event": {},
+                "candidates": [_format_booking_candidate_label(item) for item in candidate_results[:5]],
+            }
+        )
+
+    chosen_candidate = candidate_results[0]
+    if chosen_candidate.get("listing_code") == booking_resolution.listing_code:
+        return booking_resolution
+
+    thread_filter.pending_booking = {
+        "status": "pending_confirmation",
+        "listing_code": chosen_candidate["listing_code"],
+        "event_snapshot": chosen_candidate,
+        "selected_at": timezone.now().isoformat(),
+    }
+    thread_filter.save(update_fields=["pending_booking", "updated_at"])
+    return booking_resolution.model_copy(
+        update={
+            "listing_code": chosen_candidate["listing_code"],
+            "selected_event": chosen_candidate,
+        }
+    )
+
+
+def _should_fall_through_to_search(*, user_message: str, thread_filter: ThreadFilter) -> bool:
+    if not thread_filter.pending_booking:
+        return False
+    message = user_message.strip().lower()
+    if not message:
+        return False
+
+    booking_verbs = ("book", "reserve")
+    confirmation_terms = ("yes", "confirm", "go ahead", "proceed", "do it", "this one")
+    rejection_terms = ("no", "cancel", "not this one", "don't")
+    return not any(term in message for term in (*booking_verbs, *confirmation_terms, *rejection_terms))
+
+
+def _rescue_booking_selection_from_result_context(
+    *,
+    user_message: str,
+    thread_filter: ThreadFilter,
+):
+    if not _looks_like_booking_selection(user_message):
+        return None
+
+    results = (thread_filter.latest_result_context or {}).get("results", [])
+    candidate_results = _derive_booking_selection_candidates(user_message=user_message, results=results)
+    if not candidate_results:
+        return None
+
+    if len(candidate_results) > 1:
+        clear_thread_pending_booking(thread_filter=thread_filter)
+        return BookingTurnResolution(
+            action="ambiguous",
+            message=(
+                f"I found multiple matching events in the current results: "
+                f"{', '.join(_format_booking_candidate_label(item) for item in candidate_results[:3])}. "
+                "Please tell me which one you want to book."
+            ),
+            candidates=[_format_booking_candidate_label(item) for item in candidate_results[:5]],
+        )
+
+    chosen_candidate = candidate_results[0]
+    thread_filter.pending_booking = {
+        "status": "pending_confirmation",
+        "listing_code": chosen_candidate["listing_code"],
+        "event_snapshot": chosen_candidate,
+        "selected_at": timezone.now().isoformat(),
+    }
+    thread_filter.save(update_fields=["pending_booking", "updated_at"])
+    return BookingTurnResolution(
+        action="selection_pending",
+        message=f"I have selected '{chosen_candidate.get('title', 'that event')}' for booking. Please confirm if you want to proceed.",
+        listing_code=chosen_candidate["listing_code"],
+        selected_event=chosen_candidate,
+    )
+
+
+def _looks_like_booking_selection(user_message: str) -> bool:
+    message = user_message.strip().lower()
+    if not message:
+        return False
+    return any(term in message for term in ("book", "reserve"))
+
+
+def _derive_booking_selection_candidates(*, user_message: str, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not results:
+        return []
+
+    message = user_message.strip().lower()
+    if not message or "book" not in message:
+        return []
+
+    ordinal_match = re.search(r"\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|last)\b", message)
+    if ordinal_match:
+        ordinal = ordinal_match.group(1)
+        position_map = {
+            "first": 1,
+            "1st": 1,
+            "second": 2,
+            "2nd": 2,
+            "third": 3,
+            "3rd": 3,
+            "fourth": 4,
+            "4th": 4,
+            "fifth": 5,
+            "5th": 5,
+            "last": len(results),
+        }
+        position = position_map.get(ordinal)
+        return [item for item in results if item.get("position") == position]
+
+    matches: list[dict[str, Any]] = []
+    for item in results:
+        for field_name in ("title", "venue_name", "city"):
+            value = (item.get(field_name) or "").strip().lower()
+            if value and value in message:
+                matches.append(item)
+                break
+    deduped: dict[str, dict[str, Any]] = {item["listing_code"]: item for item in matches}
+    return list(deduped.values())
+
+
+def _format_booking_candidate_label(item: dict[str, Any]) -> str:
+    title = item.get("title", "event")
+    venue_name = item.get("venue_name", "")
+    city = item.get("city", "")
+    if venue_name and city:
+        return f"{title} at {venue_name}, {city}"
+    if city:
+        return f"{title} in {city}"
+    return title
+
+
+def _results_by_domain_from_latest_context(latest_result_context: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not latest_result_context:
+        return {}
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in latest_result_context.get("results", []):
+        domain = item.get("domain")
+        if not domain:
+            continue
+        grouped.setdefault(domain, []).append(
+            {
+                "id": item.get("listing_code", ""),
+                "listing_code": item.get("listing_code", ""),
+                "title": item.get("title", ""),
+                "city": item.get("city", ""),
+                "venue_name": item.get("venue_name", ""),
+                "event_date": item.get("event_date", ""),
+                "start_at": item.get("start_at", ""),
+                "min_price": item.get("min_price"),
+                "max_price": item.get("max_price"),
+                "genres": item.get("genres", []),
+                "sport_type": item.get("sport_type"),
+            }
+        )
+
+    return {
+        domain: {
+            "count": len(results),
+            "limit": len(results),
+            "offset": 0,
+            "filters": {},
+            "results": results,
+        }
+        for domain, results in grouped.items()
     }
 
 def _get_or_create_thread(*, user_message: str, thread_id: str | None) -> tuple[ChatThread, bool]:
