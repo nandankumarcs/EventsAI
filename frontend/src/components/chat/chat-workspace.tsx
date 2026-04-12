@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   Bot,
@@ -9,7 +9,6 @@ import {
   Plus,
   SendHorizontal,
   Sparkles,
-  TicketCheck,
 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
@@ -21,20 +20,19 @@ import type {
   ThreadDetail,
   ThreadMessage,
 } from '@/lib/api'
+import { getRandomPrompts } from '@/lib/prompts'
 
 type ChatWorkspaceProps = {
   thread: ThreadDetail | null
   draft: string
   sending: boolean
-  bookingListingCode: string | null
   loadingThread: boolean
   healthError: string | null
   actionError: string | null
   actionRetryLabel: string | null
   isCreatingThread: boolean
   onDraftChange: (value: string) => void
-  onSend: () => void
-  onBook: (listingCode: string) => void
+  onSend: (message?: string) => void
   onCreateThread: () => void
   onRetryHealth: () => void
   onRetryAction: () => void
@@ -44,7 +42,6 @@ export function ChatWorkspace({
   thread,
   draft,
   sending,
-  bookingListingCode,
   loadingThread,
   healthError,
   actionError,
@@ -52,7 +49,6 @@ export function ChatWorkspace({
   isCreatingThread,
   onDraftChange,
   onSend,
-  onBook,
   onCreateThread,
   onRetryHealth,
   onRetryAction,
@@ -61,6 +57,10 @@ export function ChatWorkspace({
   const pendingBooking = isPendingBooking(thread?.pending_booking) ? thread.pending_booking : null
   const awaitingFieldLabel = formatAwaitingFieldLabel(pendingBooking?.awaiting_field)
   const historyRef = useRef<HTMLDivElement | null>(null)
+
+  // Randomly fetch 4 prompts on mount
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const suggestedPrompts = useMemo(() => getRandomPrompts(4), [thread?.id])
 
   useEffect(() => {
     const node = historyRef.current
@@ -120,13 +120,7 @@ export function ChatWorkspace({
                 </p>
               </div>
               <div className="max-w-[286px]">
-                <ResultCard
-                  result={normalizePendingBookingResult(pendingBooking)}
-                  disabled
-                  isBooking={false}
-                  buttonLabelOverride={awaitingFieldLabel ? `Awaiting ${awaitingFieldLabel}` : 'Awaiting chat confirmation'}
-                  onBook={onBook}
-                />
+                <ResultCard result={normalizePendingBookingResult(pendingBooking)} />
               </div>
             </div>
           ) : null}
@@ -138,13 +132,34 @@ export function ChatWorkspace({
           ) : null}
 
           {!loadingThread && (!thread || thread.messages.length === 0) && !sending ? (
-            <div className="flex flex-col items-center justify-center gap-2 pt-24 pb-8 min-h-[50vh] text-center">
-              <h1 className="text-[28px] font-medium tracking-tight text-foreground/80">
-                {getGreeting()}
-              </h1>
-              <p className="text-xl text-muted-foreground/80">
-                What event are we planning today?
-              </p>
+            <div className="flex flex-col items-center justify-center gap-8 pt-16 pb-8 min-h-[50vh] text-center max-w-2xl mx-auto w-full">
+              <div className="space-y-2">
+                <h1 className="text-[28px] font-medium tracking-tight text-foreground/80">
+                  {getGreeting()}
+                </h1>
+                <p className="text-xl text-muted-foreground/80">
+                  What event are we planning today?
+                </p>
+              </div>
+
+              <div className="grid w-full grid-cols-1 sm:grid-cols-2 gap-3 text-left">
+                {suggestedPrompts.map((prompt: { icon: any; text: string }, idx: number) => {
+                  const Icon = prompt.icon
+                  return (
+                    <button
+                      key={idx}
+                      type="button"
+                      className="group flex flex-col justify-between gap-3 rounded-2xl border border-border/60 bg-muted/40 p-4 transition-all hover:border-primary/30 hover:bg-muted hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 active:scale-[0.98]"
+                      onClick={() => onSend(prompt.text)}
+                    >
+                      <Icon className="size-5 text-muted-foreground group-hover:text-primary transition-colors" />
+                      <span className="text-[14px] text-foreground/90 font-medium">
+                        {prompt.text}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
             </div>
           ) : null}
 
@@ -155,28 +170,28 @@ export function ChatWorkspace({
                   key={message.id}
                   message={message}
                   threadStatus={thread.status}
-                  bookingListingCode={bookingListingCode}
-                  onBook={onBook}
                 />
               ))}
-              
-              {sending ? (
-                <div className="flex w-full justify-start">
-                  <div className="max-w-full space-y-3 w-full">
-                    <div className="bg-transparent text-foreground">
-                      <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                        <Bot className="size-4" />
-                        <span>Events AI</span>
-                      </div>
-                      <div className="flex space-x-1.5 mt-2 h-6 items-center">
-                        <div className="w-2 h-2 bg-primary/40 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
-                        <div className="w-2 h-2 bg-primary/40 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
-                        <div className="w-2 h-2 bg-primary/40 rounded-full animate-bounce"></div>
-                      </div>
+            </div>
+          ) : null}
+
+          {!loadingThread && sending ? (
+            <div className="flex flex-col gap-8 pb-4 mt-8">
+              <div className="flex w-full justify-start">
+                <div className="max-w-full space-y-3 w-full">
+                  <div className="bg-transparent text-foreground">
+                    <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      <Bot className="size-4" />
+                      <span>Events AI</span>
+                    </div>
+                    <div className="flex space-x-1.5 mt-2 h-6 items-center">
+                      <div className="w-2 h-2 bg-primary/40 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
+                      <div className="w-2 h-2 bg-primary/40 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
+                      <div className="w-2 h-2 bg-primary/40 rounded-full animate-bounce"></div>
                     </div>
                   </div>
                 </div>
-              ) : null}
+              </div>
             </div>
           ) : null}
 
@@ -260,16 +275,9 @@ export function ChatWorkspace({
 type MessageBlockProps = {
   message: ThreadMessage
   threadStatus: ThreadDetail['status']
-  bookingListingCode: string | null
-  onBook: (listingCode: string) => void
 }
 
-function MessageBlock({
-  message,
-  threadStatus,
-  bookingListingCode,
-  onBook,
-}: MessageBlockProps) {
+function MessageBlock({ message, threadStatus }: MessageBlockProps) {
   const isAssistant = message.role === 'assistant'
   const resultsByDomain = message.metadata.results_by_domain ?? {}
   const allResults = Object.values(resultsByDomain).flatMap((domain) => domain.results)
@@ -293,30 +301,19 @@ function MessageBlock({
 
           {message.metadata.booking_reference ? (
             <div className="mt-3 inline-flex items-center gap-2 rounded-full bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-800">
-              <TicketCheck className="size-3.5" />
+              <span>✓</span>
               Ref {message.metadata.booking_reference}
             </div>
           ) : null}
         </div>
 
         {isAssistant && allResults.length > 0 ? (
-          <ResultCarousel
-            results={allResults}
-            threadStatus={threadStatus}
-            bookingListingCode={bookingListingCode}
-            onBook={onBook}
-          />
+          <ResultCarousel results={allResults} threadStatus={threadStatus} />
         ) : null}
 
         {isAssistant && selectedBookingResult ? (
           <div className="max-w-[286px]">
-            <ResultCard
-              result={selectedBookingResult}
-              disabled
-              isBooking={false}
-              buttonLabelOverride="Awaiting chat confirmation"
-              onBook={onBook}
-            />
+            <ResultCard result={selectedBookingResult} />
           </div>
         ) : null}
       </div>
@@ -327,13 +324,9 @@ function MessageBlock({
 function ResultCarousel({
   results,
   threadStatus,
-  bookingListingCode,
-  onBook,
 }: {
   results: SearchResultItem[]
   threadStatus?: string
-  bookingListingCode: string | null
-  onBook: (listingCode: string) => void
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [canScrollLeft, setCanScrollLeft] = useState(false)
@@ -381,9 +374,7 @@ function ResultCarousel({
           <ResultCard
             key={result.listing_code}
             result={result}
-            disabled={threadStatus === 'booked'}
-            isBooking={bookingListingCode === result.listing_code}
-            onBook={onBook}
+            booked={threadStatus === 'booked'}
           />
         ))}
       </div>
@@ -403,13 +394,10 @@ function ResultCarousel({
 
 type ResultCardProps = {
   result: SearchResultItem
-  disabled: boolean
-  isBooking: boolean
-  buttonLabelOverride?: string
-  onBook: (listingCode: string) => void
+  booked?: boolean
 }
 
-function ResultCard({ result, disabled, isBooking, buttonLabelOverride, onBook }: ResultCardProps) {
+function ResultCard({ result, booked }: ResultCardProps) {
   const eventTypeLabel = result.sport_type ?? result.genres?.slice(0, 2).join(', ') ?? 'Event'
 
   return (
@@ -442,15 +430,9 @@ function ResultCard({ result, disabled, isBooking, buttonLabelOverride, onBook }
           </p>
         ) : null}
 
-        <Button
-          type="button"
-          className="w-full"
-          disabled={disabled || isBooking}
-          onClick={() => onBook(result.listing_code)}
-        >
-          <TicketCheck className="size-4" />
-          {buttonLabelOverride ?? (disabled ? 'Booking saved' : isBooking ? 'Confirming...' : 'Confirm booking')}
-        </Button>
+        {booked ? (
+          <p className="text-xs font-medium text-emerald-700">✓ Booking saved</p>
+        ) : null}
       </div>
     </div>
   )
@@ -530,8 +512,8 @@ function formatEventDateTime(eventDate: string, startAt: string) {
 }
 
 function getGreeting() {
-  const hour = new Date().getHours()
-  if (hour < 12) return 'Good morning'
-  if (hour < 17) return 'Good afternoon'
+  const currentHour = new Date().getHours()
+  if (currentHour < 12) return 'Good morning'
+  if (currentHour < 18) return 'Good afternoon'
   return 'Good evening'
 }

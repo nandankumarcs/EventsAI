@@ -9,6 +9,7 @@ class ChatThread(UUIDTimeStampedModel):
         ACTIVE = "active", "Active"
         BOOKED = "booked", "Booked"
         ARCHIVED = "archived", "Archived"
+        DELETED = "deleted", "Deleted"
 
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True)

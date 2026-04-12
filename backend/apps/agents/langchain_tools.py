@@ -7,9 +7,9 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Literal
 
-from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
+from langgraph.prebuilt import create_react_agent
 from langchain.tools import tool
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
 
@@ -108,6 +108,23 @@ def get_chat_model(*, resolver: bool = False):
     return ChatOpenAI(model=model_name, temperature=0)
 
 
+def generate_dynamic_thread_title(history_messages: list[str]) -> str:
+    llm = get_chat_model(resolver=True)
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are a concise title generator. Based on the user's chat history, provide a 2 to 5 word title that best summarizes the main topic of the conversation. Do not use quotes, punctuation, or generic terms like 'Chat about'."),
+        ("user", "Conversation history:\n{history}")
+    ])
+    
+    chain = prompt | llm
+    try:
+        response = chain.invoke({"history": "\n".join(history_messages[-5:])})
+        return response.content.strip(' "”\'')[:255]
+    except Exception as e:
+        logger.error(f"Failed to generate thread title: {e}")
+        return "New thread"
+
+
 @lru_cache(maxsize=1)
 def _build_event_type_agent():
     @tool("get_all_event_types")
@@ -115,11 +132,11 @@ def _build_event_type_agent():
         """Return the event types currently available in the platform."""
         return get_all_event_types()
 
-    return create_agent(
+    return create_react_agent(
         model=get_chat_model(resolver=True),
         tools=[available_event_types],
-        response_format=ToolStrategy(FilterResolution),
-        system_prompt=(
+        response_format=FilterResolution,
+        prompt=(
             "You resolve event type filters for a booking request.\n"
             "You must call get_all_event_types before deciding.\n"
             "Return only canonical values returned by that tool in active_filters_partial.event_types.\n"
@@ -141,11 +158,11 @@ def _build_location_agent():
         """Return all available sport cities."""
         return get_available_sport_locations()
 
-    return create_agent(
+    return create_react_agent(
         model=get_chat_model(resolver=True),
         tools=[movie_locations, sport_locations],
-        response_format=ToolStrategy(FilterResolution),
-        system_prompt=(
+        response_format=FilterResolution,
+        prompt=(
             "You resolve city filters from the user request.\n"
             "The user message is provided as JSON with user_message, allowed_domains, and current_filters.\n"
             "You must inspect the available city tools before deciding.\n"
@@ -204,7 +221,7 @@ def _build_temporal_agent():
         """Return a standard time range for a named period like morning, afternoon, evening, or night."""
         return get_named_time_bucket(label=label)
 
-    return create_agent(
+    return create_react_agent(
         model=get_chat_model(resolver=True),
         tools=[
             temporal_reference_tool,
@@ -216,8 +233,8 @@ def _build_temporal_agent():
             build_time_window_tool,
             get_named_time_bucket_tool,
         ],
-        response_format=ToolStrategy(FilterResolution),
-        system_prompt=(
+        response_format=FilterResolution,
+        prompt=(
             "You resolve temporal filters from the user request.\n"
             "The user message is provided as JSON with user_message, reference_date, and current_filters.\n"
             "You must use tools for any calendar or clock calculation. Do not do date math in your head.\n"
@@ -289,7 +306,7 @@ def _build_movie_filter_agent():
         """Return movie content origin labels currently available."""
         return get_available_movie_content_origins()
 
-    return create_agent(
+    return create_react_agent(
         model=get_chat_model(resolver=True),
         tools=[
             movie_titles,
@@ -303,8 +320,8 @@ def _build_movie_filter_agent():
             movie_franchises,
             movie_content_origins,
         ],
-        response_format=ToolStrategy(FilterResolution),
-        system_prompt=(
+        response_format=FilterResolution,
+        prompt=(
             "You resolve movie-specific filters from the user request.\n"
             "The user message is provided as JSON with user_message and current_filters.\n"
             "You must rely on the tool outputs and return only exact canonical values from them.\n"
@@ -384,7 +401,7 @@ def _build_sport_filter_agent():
         """Return sport match numbers currently available."""
         return get_available_sport_match_numbers()
 
-    return create_agent(
+    return create_react_agent(
         model=get_chat_model(resolver=True),
         tools=[
             sport_types,
@@ -401,8 +418,8 @@ def _build_sport_filter_agent():
             sport_organizers,
             sport_match_numbers,
         ],
-        response_format=ToolStrategy(FilterResolution),
-        system_prompt=(
+        response_format=FilterResolution,
+        prompt=(
             "You resolve sport-specific filters from the user request.\n"
             "The user message is provided as JSON with user_message and current_filters.\n"
             "You must rely on the tool outputs and return only exact canonical values from them.\n"
@@ -422,11 +439,11 @@ def _build_sport_catalog_agent():
         """Return sport types currently available."""
         return get_available_sport_types()
 
-    return create_agent(
+    return create_react_agent(
         model=get_chat_model(resolver=True),
         tools=[sport_types],
-        response_format=ToolStrategy(CatalogInquiry),
-        system_prompt=(
+        response_format=CatalogInquiry,
+        prompt=(
             "You detect when the user is asking an informational catalog question about available sports.\n"
             "The user message is provided as JSON with user_message.\n"
             "You must call get_sport_types before answering.\n"
@@ -511,14 +528,14 @@ def _booking_tools():
 def _build_booking_selection_agent():
     tools = _booking_tools()
 
-    return create_agent(
+    return create_react_agent(
         model=get_chat_model(resolver=True),
         tools=[
             tools["thread_booking_context"],
             tools["mark_pending_booking"],
         ],
-        response_format=ToolStrategy(BookingTurnResolution),
-        system_prompt=(
+        response_format=BookingTurnResolution,
+        prompt=(
             "You handle conversational event selection for booking inside an event booking thread.\n"
             "There is no pending booking before this turn.\n"
             "The user message is provided as JSON with thread_id and user_message.\n"
@@ -541,7 +558,7 @@ def _build_booking_selection_agent():
 def _build_booking_confirmation_agent():
     tools = _booking_tools()
 
-    return create_agent(
+    return create_react_agent(
         model=get_chat_model(resolver=True),
         tools=[
             tools["thread_booking_context"],
@@ -549,8 +566,8 @@ def _build_booking_confirmation_agent():
             tools["clear_pending_booking"],
             tools["confirm_pending_booking"],
         ],
-        response_format=ToolStrategy(BookingTurnResolution),
-        system_prompt=(
+        response_format=BookingTurnResolution,
+        prompt=(
             "You handle booking confirmation for a thread that already has a pending booking awaiting confirmation.\n"
             "The user message is provided as JSON with thread_id and user_message.\n"
             "You must call get_thread_booking_context first so you know the selected event, active filters, and latest results.\n"
@@ -574,7 +591,7 @@ def _build_booking_confirmation_agent():
 def _build_booking_user_info_agent():
     tools = _booking_tools()
 
-    return create_agent(
+    return create_react_agent(
         model=get_chat_model(resolver=True),
         tools=[
             tools["thread_booking_context"],
@@ -582,8 +599,8 @@ def _build_booking_user_info_agent():
             tools["save_pending_booking_user_info"],
             tools["confirm_pending_booking"],
         ],
-        response_format=ToolStrategy(BookingTurnResolution),
-        system_prompt=(
+        response_format=BookingTurnResolution,
+        prompt=(
             "You handle the missing-user-info stage for a pending booking.\n"
             "The user message is provided as JSON with thread_id and user_message.\n"
             "You must call get_thread_booking_context first and inspect pending_booking.awaiting_field and missing_fields.\n"

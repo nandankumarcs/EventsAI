@@ -17,7 +17,12 @@ def thread_list_create_view(request: HttpRequest) -> JsonResponse:
         except ValueError:
             return JsonResponse({"error": "Invalid pagination parameters"}, status=400)
 
-        queryset = ChatThread.objects.select_related("filter_state").prefetch_related("messages").order_by("-last_activity_at")
+        queryset = (
+            ChatThread.objects.exclude(status=ChatThread.Status.DELETED)
+            .select_related("filter_state")
+            .prefetch_related("messages")
+            .order_by("-last_activity_at")
+        )
         total_count = queryset.count()
         subset = queryset[offset : offset + limit]
 
@@ -44,14 +49,23 @@ def thread_list_create_view(request: HttpRequest) -> JsonResponse:
     return JsonResponse({"thread": _serialize_thread_detail(thread)}, status=201)
 
 
+@csrf_exempt
 def thread_detail_view(request: HttpRequest, thread_id) -> JsonResponse:
-    if request.method != "GET":
-        return HttpResponseNotAllowed(["GET"])
+    if request.method not in ("GET", "DELETE"):
+        return HttpResponseNotAllowed(["GET", "DELETE"])
 
     thread = get_object_or_404(
-        ChatThread.objects.select_related("filter_state").prefetch_related("messages"),
+        ChatThread.objects.exclude(status=ChatThread.Status.DELETED)
+        .select_related("filter_state")
+        .prefetch_related("messages"),
         id=thread_id,
     )
+
+    if request.method == "DELETE":
+        thread.status = ChatThread.Status.DELETED
+        thread.save(update_fields=["status"])
+        return JsonResponse({"success": True})
+
     return JsonResponse({"thread": _serialize_thread_detail(thread)})
 
 

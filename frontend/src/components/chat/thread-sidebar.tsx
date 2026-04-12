@@ -1,5 +1,5 @@
-import { useEffect, useRef } from 'react'
-import { Plus } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { Plus, Trash2, Check, X } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import type { ThreadSummary } from '@/lib/api'
@@ -15,6 +15,7 @@ type ThreadSidebarProps = {
   onLoadMore: () => void
   onCreateThread: () => void
   onSelectThread: (threadId: string) => void
+  onDeleteThread: (threadId: string) => void
 }
 
 export function ThreadSidebar({
@@ -27,8 +28,10 @@ export function ThreadSidebar({
   onLoadMore,
   onCreateThread,
   onSelectThread,
+  onDeleteThread,
 }: ThreadSidebarProps) {
   const sentinelRef = useRef<HTMLDivElement>(null)
+  const [threadToDelete, setThreadToDelete] = useState<string | null>(null)
 
   useEffect(() => {
     if (!sentinelRef.current || !hasMore || isLoadingMore) {
@@ -86,20 +89,73 @@ export function ThreadSidebar({
 
           {threads.map((thread) => {
             const isActive = thread.id === selectedThreadId
+            const isConfirming = threadToDelete === thread.id
+
+            if (isConfirming) {
+              return (
+                <div
+                  key={thread.id}
+                  className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm bg-destructive/15 text-destructive font-medium transition"
+                >
+                  <span className="flex-1 truncate text-left">Sure?</span>
+                  <div className="ml-2 flex items-center gap-1">
+                    <button
+                      type="button"
+                      className="flex items-center justify-center rounded p-1 hover:bg-destructive/25 focus:outline-none"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setThreadToDelete(null)
+                        onDeleteThread(thread.id)
+                      }}
+                      title="Confirm delete"
+                    >
+                      <Check className="size-[14px]" />
+                    </button>
+                    <button
+                      type="button"
+                      className="flex items-center justify-center rounded p-1 hover:bg-destructive/25 focus:outline-none"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setThreadToDelete(null)
+                      }}
+                      title="Cancel"
+                    >
+                      <X className="size-[14px]" />
+                    </button>
+                  </div>
+                </div>
+              )
+            }
+
             return (
-              <button
+              <div
                 key={thread.id}
-                type="button"
                 className={cn(
-                  'block w-full rounded-lg px-3 py-2.5 text-left text-sm transition',
+                  'group flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm transition',
                   isActive
                     ? 'bg-accent/80 font-medium text-accent-foreground'
                     : 'text-muted-foreground hover:bg-accent/40 hover:text-foreground',
                 )}
-                onClick={() => onSelectThread(thread.id)}
               >
-                <div className="truncate">{thread.title}</div>
-              </button>
+                <button
+                  type="button"
+                  className="flex-1 text-left truncate focus:outline-none"
+                  onClick={() => onSelectThread(thread.id)}
+                >
+                  {thread.title}
+                </button>
+                <button
+                  type="button"
+                  className="ml-2 flex items-center justify-center rounded p-1 opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100 focus:opacity-100 focus:outline-none"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setThreadToDelete(thread.id)
+                  }}
+                  title="Delete chat"
+                >
+                  <Trash2 className="size-[14px]" />
+                </button>
+              </div>
             )
           })}
 

@@ -246,3 +246,9 @@ export async function confirmBooking(threadId: string, listingCode: string) {
     },
   )
 }
+
+export async function deleteThread(threadId: string) {
+  return request<{ success: boolean }>(`/api/chats/threads/${threadId}/`, {
+    method: 'DELETE',
+  })
+}

@@ -5,7 +5,12 @@ from typing import Any
 from django.db.models import Max
 from django.utils import timezone
 
-from apps.agents.langchain_tools import ResolutionIssue, invoke_booking_agent, resolve_turn_filters
+from apps.agents.langchain_tools import (
+    ResolutionIssue,
+    generate_dynamic_thread_title,
+    invoke_booking_agent,
+    resolve_turn_filters,
+)
 from apps.agents.schemas import ActiveFilters
 from apps.bookings.services import build_latest_result_context
 from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
@@ -100,6 +105,9 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
         thread.last_message_preview = booking_resolution.message[:500]
         thread.last_activity_at = timezone.now()
         thread.save(update_fields=["last_message_preview", "last_activity_at", "updated_at"])
+        
+        _update_dynamic_thread_title(thread)
+        
         return {
             "thread": _serialize_thread(thread),
             "assistant_message": _serialize_message(assistant_message),
@@ -205,6 +213,8 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
     thread.last_activity_at = timezone.now()
     thread.save(update_fields=["last_message_preview", "last_activity_at", "updated_at"])
 
+    _update_dynamic_thread_title(thread)
+
     return {
         "thread": _serialize_thread(thread),
         "assistant_message": _serialize_message(assistant_message),
@@ -291,6 +301,29 @@ def _assert_thread_accepts_messages(thread: ChatThread) -> None:
 def _get_or_create_thread_filter(thread: ChatThread) -> ThreadFilter:
     thread_filter, _created = ThreadFilter.objects.get_or_create(thread=thread)
     return thread_filter
+
+
+def _update_dynamic_thread_title(thread: ChatThread) -> None:
+    # Extract max 5 recent user messages to keep the LLM fast
+    recent_user_messages = list(
+        thread.messages.filter(role=ChatMessage.Role.USER)
+        .order_by("-position")[:5]
+        .values_list("content", flat=True)
+    )
+    recent_user_messages.reverse()
+    
+    if not recent_user_messages:
+        return
+        
+    try:
+        new_title = generate_dynamic_thread_title(recent_user_messages)
+        if new_title and new_title.lower() != "new thread":
+            thread.title = new_title
+            thread.save(update_fields=["title", "updated_at"])
+            # Refresh if necessary
+            thread.refresh_from_db(fields=["title", "updated_at"])
+    except Exception:
+        pass
 
 
 def _append_message(
