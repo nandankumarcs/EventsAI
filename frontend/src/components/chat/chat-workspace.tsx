@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 import {
+  ArrowDown,
   Bot,
   CalendarDays,
   ChevronLeft,
@@ -21,6 +22,7 @@ import type {
   ThreadMessage,
 } from '@/lib/api'
 import { getRandomPrompts } from '@/lib/prompts'
+import { Skeleton } from '@/components/ui/skeleton'
 
 type ChatWorkspaceProps = {
   thread: ThreadDetail | null
@@ -57,21 +59,40 @@ export function ChatWorkspace({
   const pendingBooking = isPendingBooking(thread?.pending_booking) ? thread.pending_booking : null
   const awaitingFieldLabel = formatAwaitingFieldLabel(pendingBooking?.awaiting_field)
   const historyRef = useRef<HTMLDivElement | null>(null)
+  const [isAtBottom, setIsAtBottom] = useState(true)
 
   // Randomly fetch 4 prompts on mount
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const suggestedPrompts = useMemo(() => getRandomPrompts(4), [thread?.id])
 
-  useEffect(() => {
+  // Track whether the user has scrolled away from the bottom
+  function handleScroll() {
     const node = historyRef.current
-    if (!node) {
-      return
+    if (!node) return
+    const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight
+    setIsAtBottom(distanceFromBottom < 80)
+  }
+
+  function scrollToBottom(behavior: ScrollBehavior = 'smooth') {
+    const node = historyRef.current
+    if (!node) return
+    node.scrollTo({ top: node.scrollHeight, behavior })
+    setIsAtBottom(true)
+  }
+
+  // Auto-scroll when new messages arrive — only if user is already at the bottom
+  useEffect(() => {
+    if (isAtBottom) {
+      scrollToBottom('smooth')
     }
-    node.scrollTo({
-      top: node.scrollHeight,
-      behavior: 'smooth',
-    })
-  }, [thread?.id, thread?.messages.length, loadingThread, sending])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [thread?.messages.length, sending])
+
+  // Always scroll to bottom when switching threads
+  useEffect(() => {
+    scrollToBottom('instant')
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [thread?.id, loadingThread])
 
   return (
     <main className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background">
@@ -86,8 +107,13 @@ export function ChatWorkspace({
         </div>
       </header>
 
-      {/* Main scrolling area */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto" ref={historyRef}>
+      {/* Main scrolling area — wrapper is relative so the FAB can be absolutely positioned */}
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <div
+          className="flex min-h-0 flex-1 flex-col overflow-y-auto"
+          ref={historyRef}
+          onScroll={handleScroll}
+        >
         <div className="mx-auto w-full max-w-4xl px-4 py-6 md:py-10 space-y-6">
           {isBookedThread ? (
             <div className="flex flex-col gap-3 rounded-[22px] border border-emerald-500/20 bg-emerald-500/8 px-4 py-4 text-sm text-emerald-900 sm:flex-row sm:items-center sm:justify-between">
@@ -126,8 +152,47 @@ export function ChatWorkspace({
           ) : null}
 
           {loadingThread ? (
-            <div className="flex min-h-[50vh] items-center justify-center text-sm text-muted-foreground">
-              Loading conversation...
+            <div className="flex flex-col gap-8 pb-4">
+              {/* AI message skeleton */}
+              <div className="flex w-full justify-start">
+                <div className="w-full max-w-full space-y-3">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Skeleton className="size-4 rounded-full" />
+                    <Skeleton className="h-3 w-20 rounded-full" />
+                  </div>
+                  <Skeleton className="h-4 w-[90%] rounded-full" />
+                  <Skeleton className="h-4 w-[75%] rounded-full" />
+                  <Skeleton className="h-4 w-[55%] rounded-full" />
+                </div>
+              </div>
+
+              {/* User message skeleton */}
+              <div className="flex w-full justify-end">
+                <div className="max-w-sm space-y-2">
+                  <Skeleton className="h-10 w-52 rounded-3xl" />
+                </div>
+              </div>
+
+              {/* AI message skeleton */}
+              <div className="flex w-full justify-start">
+                <div className="w-full max-w-full space-y-3">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Skeleton className="size-4 rounded-full" />
+                    <Skeleton className="h-3 w-20 rounded-full" />
+                  </div>
+                  <Skeleton className="h-4 w-[85%] rounded-full" />
+                  <Skeleton className="h-4 w-[65%] rounded-full" />
+                  <Skeleton className="h-4 w-[45%] rounded-full" />
+                  <Skeleton className="h-4 w-[70%] rounded-full" />
+                </div>
+              </div>
+
+              {/* User message skeleton */}
+              <div className="flex w-full justify-end">
+                <div className="max-w-sm space-y-2">
+                  <Skeleton className="h-10 w-72 rounded-3xl" />
+                </div>
+              </div>
             </div>
           ) : null}
 
@@ -190,6 +255,12 @@ export function ChatWorkspace({
                       <div className="w-2 h-2 bg-primary/40 rounded-full animate-bounce"></div>
                     </div>
                   </div>
+                  {/* Skeleton cards while waiting for results */}
+                  <div className="flex gap-3 overflow-hidden px-1 pb-2 pt-1">
+                    <ResultCardSkeleton />
+                    <ResultCardSkeleton />
+                    <ResultCardSkeleton />
+                  </div>
                 </div>
               </div>
             </div>
@@ -215,6 +286,19 @@ export function ChatWorkspace({
             </div>
           ) : null}
         </div>
+      </div>
+
+        {/* Scroll-to-bottom floating button — sits above the input bar */}
+        {!isAtBottom && (
+          <button
+            type="button"
+            onClick={() => scrollToBottom('smooth')}
+            className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-full border border-border/60 bg-background/90 px-3 py-1.5 text-xs font-medium text-muted-foreground shadow-md backdrop-blur transition-all hover:bg-accent hover:text-foreground z-10"
+          >
+            <ArrowDown className="size-3.5" />
+            Scroll to bottom
+          </button>
+        )}
       </div>
 
       {/* Input area */}
@@ -282,9 +366,17 @@ function MessageBlock({ message, threadStatus }: MessageBlockProps) {
   const resultsByDomain = message.metadata.results_by_domain ?? {}
   const allResults = Object.values(resultsByDomain).flatMap((domain) => domain.results)
   const selectedBookingResult = getSelectedBookingResult(message)
+  const formattedTime = message.created_at
+    ? new Date(message.created_at).toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      })
+    : null
 
   return (
-    <div className={`flex w-full ${isAssistant ? 'justify-start' : 'justify-end'}`}>
+    <div className={`group flex w-full ${isAssistant ? 'justify-start' : 'justify-end'}`}>
       <div className={`max-w-full space-y-3 ${isAssistant ? 'w-full' : 'sm:max-w-3xl'}`}>
         <div
           className={`${
@@ -306,6 +398,13 @@ function MessageBlock({ message, threadStatus }: MessageBlockProps) {
             </div>
           ) : null}
         </div>
+
+        {/* Timestamp — visible on hover */}
+        {formattedTime && (
+          <div className={`text-[11px] text-muted-foreground/60 opacity-0 transition-opacity duration-150 group-hover:opacity-100 px-1 ${isAssistant ? 'text-left' : 'text-right'}`}>
+            {formattedTime}
+          </div>
+        )}
 
         {isAssistant && allResults.length > 0 ? (
           <ResultCarousel results={allResults} threadStatus={threadStatus} />
@@ -433,6 +532,34 @@ function ResultCard({ result, booked }: ResultCardProps) {
         {booked ? (
           <p className="text-xs font-medium text-emerald-700">✓ Booking saved</p>
         ) : null}
+      </div>
+    </div>
+  )
+}
+
+function ResultCardSkeleton() {
+  return (
+    <div className="snap-start w-[272px] min-w-[272px] rounded-[24px] border border-border/70 bg-white/86 p-3.5 shadow-sm sm:w-[286px] sm:min-w-[286px]">
+      <div className="space-y-2.5">
+        {/* Title block */}
+        <div className="space-y-1.5">
+          <Skeleton className="h-5 w-[90%] rounded-full" />
+          <Skeleton className="h-5 w-[65%] rounded-full" />
+          <Skeleton className="h-3.5 w-[40%] rounded-full mt-1 opacity-60" />
+        </div>
+        {/* Location + date rows */}
+        <div className="grid gap-2">
+          <div className="flex items-center gap-2">
+            <Skeleton className="size-4 rounded-full shrink-0" />
+            <Skeleton className="h-3 w-[70%] rounded-full" />
+          </div>
+          <div className="flex items-center gap-2">
+            <Skeleton className="size-4 rounded-full shrink-0" />
+            <Skeleton className="h-3 w-[50%] rounded-full" />
+          </div>
+        </div>
+        {/* Price */}
+        <Skeleton className="h-3.5 w-[35%] rounded-full" />
       </div>
     </div>
   )

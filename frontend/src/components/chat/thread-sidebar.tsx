@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Plus, Trash2, Check, X } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
+import { Skeleton } from '@/components/ui/skeleton'
 import type { ThreadSummary } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
@@ -80,7 +81,14 @@ export function ThreadSidebar({
 
         <div className="min-h-0 flex-1 space-y-[2px] overflow-y-auto px-2 pb-4">
           {isLoading ? (
-            <div className="p-3 text-sm text-muted-foreground">Loading...</div>
+            <div className="space-y-[2px] px-1 pt-1">
+              {Array.from({ length: 6 }).map((_, i) => (
+                <div key={i} className="flex flex-col gap-1.5 rounded-lg px-3 py-2.5">
+                  <Skeleton className="h-3 w-[85%] rounded-full" style={{ width: `${60 + (i * 13) % 35}%` }} />
+                  <Skeleton className="h-2.5 w-[50%] rounded-full opacity-60" />
+                </div>
+              ))}
+            </div>
           ) : null}
 
           {!isLoading && threads.length === 0 ? (
