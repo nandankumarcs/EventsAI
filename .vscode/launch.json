@@ -11,6 +11,31 @@
       "python": "${workspaceFolder}/backend/.venv/bin/python"
     },
     {
+      "name": "Python: Django Backend (runserver)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/backend/manage.py",
+      "args": [
+        "runserver",
+        "0.0.0.0:8000"
+      ],
+      "django": true,
+      "cwd": "${workspaceFolder}/backend",
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/backend/.venv/bin/python",
+      "justMyCode": true
+    },
+    {
+      "name": "Python: Attach (debugpy :5678)",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "localhost",
+        "port": 5678
+      },
+      "justMyCode": true
+    },
+    {
       "name": "Python: Backend Unittest Current File",
       "type": "debugpy",
       "request": "launch",

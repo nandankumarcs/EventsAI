@@ -82,6 +82,8 @@ cd ..
 cd frontend && npm install && cd ..
 ```
 
+You can skip the manual steps above if you use `./start.sh` — it will bootstrap missing dependencies automatically.
+
 ### Seed data
 
 The seed command resets and repopulates movie and sport catalog data with future-only events:
@@ -102,12 +104,26 @@ make start
 ```
 
 This will:
-1. Build the React frontend (`npm run build` → `frontend/dist/`)
-2. Start the Django server at **http://127.0.0.1:8000**
+1. Install frontend dependencies if `frontend/node_modules` is missing (`npm ci`)
+2. Build the React frontend (`npm run build` → `frontend/dist/`)
+3. Create the backend virtualenv and install Python dependencies if `backend/.venv` is missing
+4. Start the Django server at **http://127.0.0.1:8000**
 
 The server now serves both the API (`/api/*`) and the compiled React SPA from a single origin. No separate frontend dev server is needed.
 
 Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
+
+### Start in dev mode (Vite + Django)
+
+If you want frontend HMR during development, start the Vite dev server alongside Django:
+
+```bash
+./start.sh --dev
+```
+
+This will start:
+1. Vite dev server at **http://127.0.0.1:5173**
+2. Django API server at **http://127.0.0.1:8000**
 
 ### Running backend only (no frontend rebuild)
 
