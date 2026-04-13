@@ -23,7 +23,13 @@ def serve_root_file(request, filename):
     return HttpResponse(status=404)
 
 
+def health_check(request):
+    """Health check endpoint for Railway."""
+    return HttpResponse("OK", content_type="text/plain")
+
+
 urlpatterns = [
+    path("health/", health_check),
     path("admin/", admin.site.urls),
     path("api/", include("apps.core.urls")),
     path("api/chats/", include("apps.chats.urls")),

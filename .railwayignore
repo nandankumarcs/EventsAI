@@ -1,0 +1,12 @@
+# Ignore local dev files
+.playwright-mcp/
+.codex-artifacts/
+tmp/
+.git/
+backend/.venv/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.env
+.DS_Store
