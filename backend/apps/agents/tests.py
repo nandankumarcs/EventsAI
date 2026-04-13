@@ -7,16 +7,19 @@ from django.utils import timezone
 from apps.agents.langchain_tools import (
     ResolutionIssue,
     TurnResolution,
+    invoke_booking_agent,
+    invoke_goal_state,
     invoke_temporal_resolver,
     resolve_turn_filters,
 )
-from apps.agents.schemas import ActiveFilters, BookingTurnResolution, CatalogInquiry, FilterResolution
-from apps.agents.services import ChatTurnError, _derive_filters_to_clear, process_chat_turn
+from apps.agents.schemas import ActiveFilters, BookingTurnResolution, CatalogInquiry, FilterResolution, GoalState, TurnPolicy
+from apps.agents.services import ChatTurnError, _derive_filters_to_clear, _update_dynamic_thread_title, process_chat_turn
 from apps.bookings.models import Booking
 from apps.bookings.services import (
     attempt_thread_pending_booking_confirmation,
     mark_thread_pending_booking,
     save_thread_booking_user_info,
+    select_thread_pending_booking,
 )
 from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
 from apps.events.models import SportEvent
@@ -24,6 +27,26 @@ from apps.events.services import SearchResult
 
 
 class AgentServiceTests(TestCase):
+    def setUp(self):
+        super().setUp()
+        self.turn_policy_patcher = patch(
+            "apps.agents.services.invoke_turn_policy",
+            return_value=TurnPolicy(intent="task_continue"),
+        )
+        self.turn_policy_mock = self.turn_policy_patcher.start()
+        self.addCleanup(self.turn_policy_patcher.stop)
+        self.goal_state_patcher = patch(
+            "apps.agents.services.invoke_goal_state",
+            return_value=GoalState(
+                goal_type="search",
+                goal_stage="browsing_results",
+                goal_summary="Event planning",
+                last_open_question="",
+            ),
+        )
+        self.goal_state_mock = self.goal_state_patcher.start()
+        self.addCleanup(self.goal_state_patcher.stop)
+
     @patch("apps.agents.services.invoke_booking_agent", return_value=BookingTurnResolution(action="none"))
     @patch("apps.agents.services.resolve_turn_filters")
     def test_process_chat_turn_persists_thread_filters_and_messages(
@@ -61,6 +84,8 @@ class AgentServiceTests(TestCase):
         self.assertEqual(thread_filter.latest_result_context["search_domains"], ["sports"])
         self.assertEqual(thread_filter.latest_result_context["results"], [])
         self.assertEqual(thread_filter.pending_booking, {})
+        thread = ChatThread.objects.get()
+        self.assertEqual(thread.metadata["goal_state"]["goal_summary"], "Event planning")
 
     @patch("apps.agents.services.resolve_turn_filters")
     @patch("apps.agents.services.invoke_booking_agent")
@@ -106,7 +131,9 @@ class AgentServiceTests(TestCase):
         resolve_turn_filters_mock.assert_not_called()
         self.assertEqual(payload["assistant_message"]["metadata"]["booking_action"], "selection_pending")
         self.assertEqual(payload["pending_booking"]["listing_code"], "SPT-1")
+        self.assertEqual(payload["search_domains"], [])
         self.assertEqual(payload["results_by_domain"], {})
+        self.assertEqual(payload["assistant_message"]["metadata"]["goal_state"]["goal_summary"], "Event planning")
 
     @patch("apps.agents.services.resolve_turn_filters")
     @patch("apps.agents.services.invoke_booking_agent")
@@ -219,6 +246,359 @@ class AgentServiceTests(TestCase):
         thread_filter.refresh_from_db()
         self.assertEqual(thread_filter.pending_booking["status"], "awaiting_user_info")
         self.assertEqual(thread_filter.pending_booking["awaiting_field"], "name")
+
+    @patch("apps.agents.langchain_tools._build_booking_selection_chain")
+    def test_invoke_booking_agent_persists_selection_from_structured_output(self, build_booking_selection_chain_mock):
+        thread = ChatThread.objects.create(title="Booking thread")
+        thread_filter = ThreadFilter.objects.create(
+            thread=thread,
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["sports"],
+                "results": [
+                    {
+                        "position": 1,
+                        "domain": "sports",
+                        "listing_code": "SPT-1",
+                        "title": "Mumbai Match",
+                        "city": "Mumbai",
+                        "venue_name": "Wankhede Stadium",
+                        "event_date": "2026-04-12",
+                        "start_at": "2026-04-12T19:30:00+05:30",
+                    }
+                ],
+            },
+        )
+        build_booking_selection_chain_mock.return_value.invoke.return_value = BookingTurnResolution(
+            action="selection_pending",
+            message="I selected Mumbai Match. Reply yes to confirm it or no to clear it.",
+            listing_code="SPT-1",
+        )
+
+        resolution = invoke_booking_agent(thread_id=str(thread.id), user_message="book this one")
+
+        thread_filter.refresh_from_db()
+        self.assertEqual(resolution.action, "selection_pending")
+        self.assertEqual(resolution.listing_code, "SPT-1")
+        self.assertEqual(resolution.selected_event.listing_code, "SPT-1")
+        self.assertEqual(thread_filter.pending_booking["listing_code"], "SPT-1")
+        self.assertEqual(thread_filter.pending_booking["status"], "pending_confirmation")
+
+    @patch("apps.agents.langchain_tools._build_booking_selection_chain")
+    def test_invoke_booking_agent_keeps_state_unchanged_for_ambiguous_selection(self, build_booking_selection_chain_mock):
+        thread = ChatThread.objects.create(title="Booking thread")
+        thread_filter = ThreadFilter.objects.create(
+            thread=thread,
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["sports"],
+                "results": [
+                    {"position": 1, "domain": "sports", "listing_code": "SPT-1", "title": "Mumbai Match"},
+                    {"position": 2, "domain": "sports", "listing_code": "SPT-2", "title": "Delhi Match"},
+                ],
+            },
+        )
+        build_booking_selection_chain_mock.return_value.invoke.return_value = BookingTurnResolution(
+            action="ambiguous",
+            message="Please tell me which visible event you want to book.",
+            candidates=["SPT-1", "SPT-2"],
+        )
+
+        resolution = invoke_booking_agent(thread_id=str(thread.id), user_message="book that one")
+
+        thread_filter.refresh_from_db()
+        self.assertEqual(resolution.action, "ambiguous")
+        self.assertEqual(thread_filter.pending_booking, {})
+
+    @patch("apps.agents.langchain_tools._build_booking_selection_chain")
+    def test_invoke_booking_agent_rejects_selection_without_listing_code(self, build_booking_selection_chain_mock):
+        thread = ChatThread.objects.create(title="Booking thread")
+        thread_filter = ThreadFilter.objects.create(
+            thread=thread,
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["sports"],
+                "results": [
+                    {"position": 1, "domain": "sports", "listing_code": "SPT-1", "title": "Mumbai Match"},
+                ],
+            },
+        )
+        build_booking_selection_chain_mock.return_value.invoke.return_value = BookingTurnResolution(
+            action="selection_pending",
+            message="I found the event you want.",
+            listing_code="",
+        )
+
+        resolution = invoke_booking_agent(thread_id=str(thread.id), user_message="book this one")
+
+        thread_filter.refresh_from_db()
+        self.assertEqual(resolution.action, "no_match")
+        self.assertEqual(thread_filter.pending_booking, {})
+
+    @patch("apps.agents.langchain_tools.attempt_thread_pending_booking_confirmation")
+    @patch("apps.agents.langchain_tools._build_booking_confirmation_chain")
+    def test_invoke_booking_agent_confirmation_routes_to_missing_user_info(
+        self,
+        build_booking_confirmation_chain_mock,
+        attempt_confirmation_mock,
+    ):
+        thread = ChatThread.objects.create(title="Booking thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            pending_booking={
+                "status": "pending_confirmation",
+                "listing_code": "SPT-1",
+                "customer_info": {"name": "", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+            latest_result_context={"results": []},
+        )
+        build_booking_confirmation_chain_mock.return_value.invoke.return_value = BookingTurnResolution(
+            action="booking_confirmed",
+            message="Yes, proceed with the booking.",
+        )
+        attempt_confirmation_mock.return_value = {
+            "status": "missing_user_info",
+            "next_required_field": "name",
+            "message": "Please share your full name to complete the booking.",
+            "pending_booking": {
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "name",
+                "customer_info": {"name": "", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+        }
+
+        resolution = invoke_booking_agent(thread_id=str(thread.id), user_message="yes")
+
+        self.assertEqual(resolution.action, "awaiting_user_info")
+        self.assertEqual(resolution.requested_field, "name")
+        self.assertEqual(resolution.listing_code, "SPT-1")
+
+    @patch("apps.agents.langchain_tools.cancel_thread_pending_booking")
+    @patch("apps.agents.langchain_tools._build_booking_confirmation_chain")
+    def test_invoke_booking_agent_confirmation_can_clear_booking(
+        self,
+        build_booking_confirmation_chain_mock,
+        cancel_pending_booking_mock,
+    ):
+        thread = ChatThread.objects.create(title="Booking thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            pending_booking={
+                "status": "pending_confirmation",
+                "listing_code": "SPT-1",
+                "customer_info": {"name": "", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+            latest_result_context={"results": []},
+        )
+        build_booking_confirmation_chain_mock.return_value.invoke.return_value = BookingTurnResolution(
+            action="booking_cleared",
+            message="Okay, I cleared that booking selection.",
+        )
+
+        resolution = invoke_booking_agent(thread_id=str(thread.id), user_message="cancel this booking")
+
+        self.assertEqual(resolution.action, "booking_cleared")
+        cancel_pending_booking_mock.assert_called_once()
+
+    @patch("apps.agents.langchain_tools.cancel_thread_pending_booking")
+    @patch("apps.agents.langchain_tools._build_booking_confirmation_chain")
+    def test_invoke_booking_agent_confirmation_can_clear_selection_for_different_event_request(
+        self,
+        build_booking_confirmation_chain_mock,
+        cancel_pending_booking_mock,
+    ):
+        thread = ChatThread.objects.create(title="Booking thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            pending_booking={
+                "status": "pending_confirmation",
+                "listing_code": "MOV-1",
+                "customer_info": {"name": "", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "MOV-1", "title": "Love and War", "domain": "movies"},
+            },
+            latest_result_context={
+                "results": [
+                    {"position": 1, "domain": "movies", "listing_code": "MOV-1", "title": "Love and War"},
+                    {"position": 2, "domain": "movies", "listing_code": "MOV-2", "title": "Kuberaa"},
+                ]
+            },
+        )
+        build_booking_confirmation_chain_mock.return_value.invoke.return_value = BookingTurnResolution(
+            action="booking_cleared",
+            message="Sure, I cleared that selection so you can pick a different movie.",
+        )
+
+        resolution = invoke_booking_agent(thread_id=str(thread.id), user_message="I want a different movie")
+
+        self.assertEqual(resolution.action, "booking_cleared")
+        self.assertIn("different movie", resolution.message.lower())
+        cancel_pending_booking_mock.assert_called_once()
+
+    @patch("apps.agents.langchain_tools.attempt_thread_pending_booking_confirmation")
+    @patch("apps.agents.langchain_tools.capture_thread_booking_user_info")
+    @patch("apps.agents.langchain_tools._build_booking_user_info_chain")
+    def test_invoke_booking_agent_user_info_saves_value_and_requests_next_field(
+        self,
+        build_booking_user_info_chain_mock,
+        capture_user_info_mock,
+        attempt_confirmation_mock,
+    ):
+        thread = ChatThread.objects.create(title="Booking thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "name",
+                "customer_info": {"name": "", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+            latest_result_context={"results": []},
+        )
+        build_booking_user_info_chain_mock.return_value.invoke.return_value = BookingTurnResolution(
+            action="booking_confirmed",
+            message="I have recorded the name as Nandan Kumar.",
+        )
+        capture_user_info_mock.return_value = {
+            "status": "saved",
+            "pending_booking": {
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": None,
+                "customer_info": {"name": "Nandan Kumar", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+        }
+        attempt_confirmation_mock.return_value = {
+            "status": "missing_user_info",
+            "next_required_field": "email",
+            "message": "Please share your email address to complete the booking.",
+            "pending_booking": {
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "email",
+                "customer_info": {"name": "Nandan Kumar", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+        }
+
+        resolution = invoke_booking_agent(thread_id=str(thread.id), user_message="Nandan Kumar")
+
+        self.assertEqual(resolution.action, "awaiting_user_info")
+        self.assertEqual(resolution.requested_field, "email")
+        capture_user_info_mock.assert_called_once_with(
+            thread_filter=thread.filter_state,
+            field_name="name",
+            value="Nandan Kumar",
+        )
+        attempt_confirmation_mock.assert_called_once()
+
+    @patch("apps.agents.langchain_tools.capture_thread_booking_user_info")
+    @patch("apps.agents.langchain_tools._build_booking_user_info_chain")
+    def test_invoke_booking_agent_user_info_handles_validation_failure(
+        self,
+        build_booking_user_info_chain_mock,
+        capture_user_info_mock,
+    ):
+        thread = ChatThread.objects.create(title="Booking thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "email",
+                "customer_info": {"name": "Nandan Kumar", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+            latest_result_context={"results": []},
+        )
+        build_booking_user_info_chain_mock.return_value.invoke.return_value = BookingTurnResolution(
+            action="booking_confirmed",
+            message="not-an-email",
+        )
+        capture_user_info_mock.return_value = {
+            "status": "invalid_user_info",
+            "message": "Please provide a valid email address.",
+            "pending_booking": {
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "email",
+                "customer_info": {"name": "Nandan Kumar", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+            "field_name": "email",
+        }
+
+        resolution = invoke_booking_agent(thread_id=str(thread.id), user_message="not-an-email")
+
+        self.assertEqual(resolution.action, "awaiting_user_info")
+        self.assertEqual(resolution.requested_field, "email")
+        self.assertIn("valid email", resolution.message.lower())
+
+    @patch("apps.agents.langchain_tools.attempt_thread_pending_booking_confirmation")
+    @patch("apps.agents.langchain_tools.capture_thread_booking_user_info")
+    @patch("apps.agents.langchain_tools._build_booking_user_info_chain")
+    def test_invoke_booking_agent_user_info_returns_full_confirmation_message(
+        self,
+        build_booking_user_info_chain_mock,
+        capture_user_info_mock,
+        attempt_confirmation_mock,
+    ):
+        thread = ChatThread.objects.create(title="Booking thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "contact_number",
+                "customer_info": {"name": "Nandan Kumar", "email": "nandan@example.com", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+            latest_result_context={"results": []},
+        )
+        build_booking_user_info_chain_mock.return_value.invoke.return_value = BookingTurnResolution(
+            action="booking_confirmed",
+            message="+91 9876543210",
+        )
+        capture_user_info_mock.return_value = {
+            "status": "saved",
+            "pending_booking": {
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": None,
+                "customer_info": {"name": "Nandan Kumar", "email": "nandan@example.com", "contact_number": "+91 9876543210"},
+                "event_snapshot": {
+                    "listing_code": "SPT-1",
+                    "title": "Mumbai Match",
+                    "city": "Mumbai",
+                    "venue_name": "Wankhede Stadium",
+                    "start_at": "2026-04-12T19:30:00+05:30",
+                    "domain": "sports",
+                },
+            },
+        }
+        attempt_confirmation_mock.return_value = {
+            "status": "confirmed",
+            "booking": {
+                "booking_reference": "ATD-BOOK1234",
+                "event_title": "Mumbai Match",
+                "city": "Mumbai",
+                "venue_name": "Wankhede Stadium",
+                "customer_name": "Nandan Kumar",
+                "customer_email": "nandan@example.com",
+                "customer_contact_number": "+91 9876543210",
+            },
+        }
+
+        resolution = invoke_booking_agent(thread_id=str(thread.id), user_message="+91 9876543210")
+
+        self.assertEqual(resolution.action, "booking_confirmed")
+        self.assertIn("Booking confirmed for Mumbai Match", resolution.message)
+        self.assertIn("ATD-BOOK1234", resolution.message)
 
     @patch("apps.agents.services.resolve_turn_filters")
     @patch("apps.agents.services.invoke_booking_agent")
@@ -375,6 +755,7 @@ class AgentServiceTests(TestCase):
             payload["assistant_message"]["metadata"]["results_by_domain"]["sports"]["results"][0]["listing_code"],
             "SPT-1",
         )
+        self.assertEqual(payload["search_domains"], ["sports"])
 
     @patch("apps.agents.services.resolve_turn_filters")
     @patch("apps.agents.services.invoke_booking_agent")
@@ -480,6 +861,54 @@ class AgentServiceTests(TestCase):
 
     @patch("apps.agents.services.resolve_turn_filters")
     @patch("apps.agents.services.invoke_booking_agent")
+    def test_process_chat_turn_reconciles_single_result_booking_ambiguity_to_selection(
+        self,
+        invoke_booking_agent_mock,
+        resolve_turn_filters_mock,
+    ):
+        thread = ChatThread.objects.create(title="Existing thread")
+        thread_filter = ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={
+                "event_types": ["sports"],
+                "cities": ["Kolkata"],
+                "event_dates": ["2026-04-19"],
+                "sport_types": ["Cricket"],
+            },
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["sports"],
+                "results": [
+                    {
+                        "position": 1,
+                        "domain": "sports",
+                        "listing_code": "SPT-IPL-028",
+                        "title": "Rajasthan Royals vs Kolkata Knight Riders",
+                        "city": "Kolkata",
+                        "venue_name": "Eden Gardens",
+                        "event_date": "2026-04-19",
+                        "start_at": "2026-04-19T10:00:00+00:00",
+                        "sport_type": "Cricket",
+                    }
+                ],
+            },
+        )
+        invoke_booking_agent_mock.return_value = BookingTurnResolution(
+            action="ambiguous",
+            message="Please specify which cricket event in Kolkata on 2026-04-19 you want to book, as there are multiple matches available.",
+        )
+
+        payload = process_chat_turn(user_message="book this one", thread_id=str(thread.id))
+
+        resolve_turn_filters_mock.assert_not_called()
+        thread_filter.refresh_from_db()
+        self.assertEqual(payload["assistant_message"]["metadata"]["booking_action"], "selection_pending")
+        self.assertEqual(payload["pending_booking"]["listing_code"], "SPT-IPL-028")
+        self.assertEqual(thread_filter.pending_booking["listing_code"], "SPT-IPL-028")
+        self.assertIn("only matching event", payload["assistant_message"]["content"].lower())
+
+    @patch("apps.agents.services.resolve_turn_filters")
+    @patch("apps.agents.services.invoke_booking_agent")
     def test_process_chat_turn_does_not_force_booking_selection_when_agent_returns_none(
         self,
         invoke_booking_agent_mock,
@@ -551,6 +980,425 @@ class AgentServiceTests(TestCase):
 
         resolve_turn_filters_mock.assert_not_called()
         self.assertEqual(payload["assistant_message"]["metadata"]["booking_action"], "booking_confirmed")
+
+    @patch("apps.agents.services.resolve_turn_filters")
+    @patch("apps.agents.services.invoke_booking_agent")
+    def test_process_chat_turn_hides_latest_results_during_user_info_stage(
+        self,
+        invoke_booking_agent_mock,
+        resolve_turn_filters_mock,
+    ):
+        thread = ChatThread.objects.create(title="Existing thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={"event_types": ["sports"], "sport_types": ["Cricket"]},
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["sports"],
+                "results": [
+                    {
+                        "position": 1,
+                        "domain": "sports",
+                        "listing_code": "SPT-1",
+                        "title": "Mumbai Match",
+                        "city": "Mumbai",
+                        "venue_name": "Wankhede Stadium",
+                        "event_date": "2026-04-12",
+                        "start_at": "2026-04-12T19:30:00+05:30",
+                        "sport_type": "Cricket",
+                    }
+                ],
+            },
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "email",
+                "customer_info": {"name": "Nandan Kumar", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match"},
+            },
+        )
+        invoke_booking_agent_mock.return_value = BookingTurnResolution(
+            action="awaiting_user_info",
+            message="Please share your email address to complete the booking.",
+            listing_code="SPT-1",
+            requested_field="email",
+        )
+
+        payload = process_chat_turn(user_message="tell me a joke first", thread_id=str(thread.id))
+
+        resolve_turn_filters_mock.assert_not_called()
+        self.assertEqual(payload["search_domains"], [])
+        self.assertEqual(payload["results_by_domain"], {})
+
+    @patch("apps.agents.services.resolve_turn_filters")
+    @patch("apps.agents.services.invoke_booking_agent")
+    def test_process_chat_turn_reselection_during_user_info_restores_requested_field(
+        self,
+        invoke_booking_agent_mock,
+        resolve_turn_filters_mock,
+    ):
+        thread = ChatThread.objects.create(title="Existing thread")
+        thread_filter = ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={"event_types": ["sports"], "sport_types": ["Cricket"]},
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["sports"],
+                "results": [
+                    {
+                        "position": 1,
+                        "domain": "sports",
+                        "listing_code": "SPT-1",
+                        "title": "Mumbai Match",
+                        "city": "Mumbai",
+                        "venue_name": "Wankhede Stadium",
+                        "event_date": "2026-04-12",
+                        "start_at": "2026-04-12T19:30:00+05:30",
+                        "sport_type": "Cricket",
+                    },
+                    {
+                        "position": 2,
+                        "domain": "sports",
+                        "listing_code": "SPT-2",
+                        "title": "Delhi Match",
+                        "city": "New Delhi",
+                        "venue_name": "Arun Jaitley Stadium",
+                        "event_date": "2026-04-13",
+                        "start_at": "2026-04-13T19:30:00+05:30",
+                        "sport_type": "Cricket",
+                    },
+                ],
+            },
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "contact_number",
+                "customer_info": {
+                    "name": "Nandan Kumar",
+                    "email": "nandan@example.com",
+                    "contact_number": "",
+                },
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match"},
+            },
+        )
+
+        def switch_pending_selection(**_kwargs):
+            thread_filter.pending_booking = {
+                "status": "pending_confirmation",
+                "listing_code": "SPT-2",
+                "awaiting_field": None,
+                "customer_info": {
+                    "name": "Nandan Kumar",
+                    "email": "nandan@example.com",
+                    "contact_number": "",
+                },
+                "event_snapshot": {
+                    "listing_code": "SPT-2",
+                    "title": "Delhi Match",
+                    "city": "New Delhi",
+                    "venue_name": "Arun Jaitley Stadium",
+                    "event_date": "2026-04-13",
+                    "start_at": "2026-04-13T19:30:00+05:30",
+                    "sport_type": "Cricket",
+                    "domain": "sports",
+                },
+            }
+            thread_filter.save(update_fields=["pending_booking", "updated_at"])
+            return BookingTurnResolution(
+                action="selection_pending",
+                message="The Delhi match has been selected.",
+                listing_code="SPT-2",
+                selected_event={"listing_code": "SPT-2", "title": "Delhi Match"},
+            )
+
+        invoke_booking_agent_mock.side_effect = switch_pending_selection
+
+        payload = process_chat_turn(user_message="book the Delhi one instead", thread_id=str(thread.id))
+
+        resolve_turn_filters_mock.assert_not_called()
+        thread_filter.refresh_from_db()
+        self.assertEqual(payload["assistant_message"]["metadata"]["booking_action"], "awaiting_user_info")
+        self.assertEqual(payload["assistant_message"]["metadata"]["requested_field"], "contact_number")
+        self.assertEqual(thread_filter.pending_booking["listing_code"], "SPT-2")
+        self.assertEqual(thread_filter.pending_booking["awaiting_field"], "contact_number")
+
+    @patch("apps.agents.services.invoke_booking_agent", return_value=BookingTurnResolution(action="none"))
+    @patch("apps.agents.services.invoke_turn_policy")
+    @patch("apps.agents.services.search_sport_events")
+    @patch("apps.agents.services.resolve_turn_filters")
+    def test_process_chat_turn_soft_redirects_off_track_and_keeps_current_results(
+        self,
+        resolve_turn_filters_mock,
+        search_sport_events_mock,
+        invoke_turn_policy_mock,
+        _invoke_booking_agent_mock,
+    ):
+        thread = ChatThread.objects.create(title="Existing thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={
+                "event_types": ["sports"],
+                "cities": ["Mumbai"],
+                "sport_types": ["Football"],
+            },
+        )
+        invoke_turn_policy_mock.return_value = TurnPolicy(
+            intent="temporary_distraction",
+            message="I can help with event plans here. Coming back to your football search, these are the current matches.",
+            should_keep_results=True,
+        )
+        search_sport_events_mock.return_value = SearchResult(
+            count=1,
+            limit=5,
+            offset=0,
+            filters={"cities": ["Mumbai"], "sport_types": ["Football"]},
+            results=[
+                {
+                    "listing_code": "SPT-FOOT-1",
+                    "title": "Mumbai City FC vs Mohun Bagan",
+                    "sport_type": "Football",
+                    "city": "Mumbai",
+                    "venue_name": "Mumbai Football Arena",
+                    "event_date": "2026-04-13",
+                    "start_at": "2026-04-13T14:00:00+00:00",
+                    "min_price": 499,
+                    "max_price": 1499,
+                }
+            ],
+        )
+
+        payload = process_chat_turn(user_message="write a poem", thread_id=str(thread.id))
+
+        resolve_turn_filters_mock.assert_not_called()
+        self.assertEqual(payload["search_domains"], ["sports"])
+        self.assertEqual(payload["results_by_domain"]["sports"]["count"], 1)
+        self.assertIn("football search", payload["assistant_message"]["content"].lower())
+        self.assertIn("Mumbai City FC vs Mohun Bagan", payload["assistant_message"]["content"])
+        self.assertEqual(payload["goal_state"]["goal_summary"], "Event planning")
+
+    @patch("apps.agents.services.invoke_booking_agent", return_value=BookingTurnResolution(action="none"))
+    @patch("apps.agents.services.invoke_turn_policy")
+    @patch("apps.agents.services.search_movie_events")
+    @patch("apps.agents.services.resolve_turn_filters")
+    def test_process_chat_turn_soft_redirect_during_booking_keeps_selection_and_hides_results(
+        self,
+        resolve_turn_filters_mock,
+        search_movie_events_mock,
+        invoke_turn_policy_mock,
+        _invoke_booking_agent_mock,
+    ):
+        thread = ChatThread.objects.create(title="Existing thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={
+                "event_types": ["movies"],
+                "cities": ["Mumbai"],
+            },
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["movies"],
+                "results": [
+                    {
+                        "position": 1,
+                        "domain": "movies",
+                        "listing_code": "MOV-1",
+                        "title": "Love and War",
+                        "city": "Mumbai",
+                        "venue_name": "PVR Phoenix",
+                        "event_date": "2026-04-18",
+                        "start_at": "2026-04-18T08:00:00+00:00",
+                    }
+                ],
+            },
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "MOV-1",
+                "awaiting_field": "contact_number",
+                "customer_info": {"name": "Nandan Kumar", "email": "nandan@example.com", "contact_number": ""},
+                "event_snapshot": {
+                    "listing_code": "MOV-1",
+                    "title": "Love and War",
+                    "city": "Mumbai",
+                    "venue_name": "PVR Phoenix",
+                    "event_date": "2026-04-18",
+                    "start_at": "2026-04-18T08:00:00+00:00",
+                    "domain": "movies",
+                },
+            },
+        )
+        invoke_turn_policy_mock.return_value = TurnPolicy(
+            intent="temporary_distraction",
+            message="Let's continue with your booking for Love and War. Please share your contact number to complete the booking.",
+            should_keep_results=True,
+        )
+        search_movie_events_mock.return_value = SearchResult(
+            count=2,
+            limit=5,
+            offset=0,
+            filters={"cities": ["Mumbai"]},
+            results=[
+                {
+                    "listing_code": "MOV-1",
+                    "title": "Love and War",
+                    "city": "Mumbai",
+                    "venue_name": "PVR Phoenix",
+                    "event_date": "2026-04-18",
+                    "start_at": "2026-04-18T08:00:00+00:00",
+                    "min_price": 315,
+                    "max_price": 375,
+                    "genres": ["Romance", "Drama"],
+                },
+                {
+                    "listing_code": "MOV-2",
+                    "title": "Kuberaa",
+                    "city": "Mumbai",
+                    "venue_name": "PVR Phoenix",
+                    "event_date": "2026-04-20",
+                    "start_at": "2026-04-20T04:45:00+00:00",
+                    "min_price": 315,
+                    "max_price": 375,
+                    "genres": ["Crime", "Drama"],
+                },
+            ],
+        )
+
+        payload = process_chat_turn(user_message="tell me a joke", thread_id=str(thread.id))
+
+        resolve_turn_filters_mock.assert_not_called()
+        self.assertEqual(payload["search_domains"], ["movies"])
+        self.assertEqual(payload["results_by_domain"], {})
+        self.assertEqual(payload["pending_booking"]["listing_code"], "MOV-1")
+        self.assertEqual(payload["assistant_message"]["metadata"]["pending_booking"]["listing_code"], "MOV-1")
+        self.assertEqual(payload["assistant_message"]["metadata"]["results_by_domain"], {})
+
+    @patch("apps.agents.services.invoke_booking_agent", return_value=BookingTurnResolution(action="none"))
+    @patch("apps.agents.services.invoke_turn_policy")
+    @patch("apps.agents.services.resolve_turn_filters")
+    def test_process_chat_turn_does_not_soft_redirect_search_change_intent(
+        self,
+        resolve_turn_filters_mock,
+        invoke_turn_policy_mock,
+        _invoke_booking_agent_mock,
+    ):
+        invoke_turn_policy_mock.return_value = TurnPolicy(
+            intent="search_change",
+            message="Looking for upcoming football matches. I'll find those for you.",
+            should_keep_results=False,
+        )
+        resolve_turn_filters_mock.return_value = TurnResolution(
+            updates=ActiveFilters(event_types=["sports"], sport_types=["Football"]),
+            tool_trace=["resolve_event_type", "resolve_sport_filters"],
+        )
+
+        payload = process_chat_turn(user_message="Show me upcoming football matches")
+
+        self.assertEqual(resolve_turn_filters_mock.call_count, 1)
+        self.assertEqual(payload["active_filters"]["event_types"], ["sports"])
+        self.assertEqual(payload["active_filters"]["sport_types"], ["Football"])
+
+    @patch("apps.agents.services.invoke_booking_agent")
+    @patch("apps.agents.services.invoke_turn_policy")
+    @patch("apps.agents.services.resolve_turn_filters")
+    def test_process_chat_turn_skips_booking_resolution_for_search_change_city_correction(
+        self,
+        resolve_turn_filters_mock,
+        invoke_turn_policy_mock,
+        invoke_booking_agent_mock,
+    ):
+        thread = ChatThread.objects.create(title="Existing thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={
+                "event_types": ["sports"],
+                "cities": ["New Delhi"],
+                "sport_types": ["Cricket"],
+            },
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["sports"],
+                "results": [
+                    {
+                        "position": 1,
+                        "domain": "sports",
+                        "listing_code": "SPT-1",
+                        "title": "Delhi Match",
+                        "city": "New Delhi",
+                        "venue_name": "Arun Jaitley Stadium",
+                        "event_date": "2026-04-18",
+                        "start_at": "2026-04-18T19:30:00+05:30",
+                        "sport_type": "Cricket",
+                    }
+                ],
+            },
+        )
+        invoke_turn_policy_mock.return_value = TurnPolicy(
+            intent="search_change",
+            message="",
+            should_keep_results=False,
+        )
+        resolve_turn_filters_mock.return_value = TurnResolution(
+            updates=ActiveFilters(cities=["Pune"]),
+            tool_trace=["resolve_location"],
+        )
+
+        payload = process_chat_turn(user_message="No wait Pune", thread_id=str(thread.id))
+
+        invoke_booking_agent_mock.assert_not_called()
+        self.assertEqual(resolve_turn_filters_mock.call_count, 1)
+        self.assertEqual(payload["active_filters"]["cities"], ["Pune"])
+        self.assertEqual(payload["active_filters"]["sport_types"], ["Cricket"])
+
+    @patch("apps.agents.services.invoke_booking_agent")
+    @patch("apps.agents.services.invoke_turn_policy")
+    @patch("apps.agents.services.resolve_turn_filters")
+    def test_process_chat_turn_skips_booking_resolution_for_search_change_domain_switch(
+        self,
+        resolve_turn_filters_mock,
+        invoke_turn_policy_mock,
+        invoke_booking_agent_mock,
+    ):
+        thread = ChatThread.objects.create(title="Existing thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            active_filters={
+                "event_types": ["movies"],
+                "cities": ["Mumbai"],
+                "languages": ["Hindi"],
+            },
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["movies"],
+                "results": [
+                    {
+                        "position": 1,
+                        "domain": "movies",
+                        "listing_code": "MOV-1",
+                        "title": "Movie Match",
+                        "city": "Mumbai",
+                        "venue_name": "PVR",
+                        "event_date": "2026-04-18",
+                        "start_at": "2026-04-18T19:30:00+05:30",
+                    }
+                ],
+            },
+        )
+        invoke_turn_policy_mock.return_value = TurnPolicy(
+            intent="search_change",
+            message="",
+            should_keep_results=False,
+        )
+        resolve_turn_filters_mock.return_value = TurnResolution(
+            updates=ActiveFilters(event_types=["sports"], sport_types=["Cricket"]),
+            tool_trace=["resolve_event_type", "resolve_sport_filters"],
+        )
+
+        payload = process_chat_turn(user_message="Show cricket matches", thread_id=str(thread.id))
+
+        invoke_booking_agent_mock.assert_not_called()
+        self.assertEqual(resolve_turn_filters_mock.call_count, 1)
+        self.assertEqual(payload["active_filters"]["event_types"], ["sports"])
+        self.assertEqual(payload["active_filters"]["sport_types"], ["Cricket"])
+        self.assertNotIn("languages", payload["active_filters"])
 
     @patch("apps.agents.services.invoke_booking_agent", return_value=BookingTurnResolution(action="none"))
     @patch("apps.agents.services.resolve_turn_filters")
@@ -676,10 +1524,12 @@ class AgentServiceTests(TestCase):
         self.assertIn("No matching sport filters", payload["assistant_message"]["content"])
 
     @patch("apps.agents.services.invoke_booking_agent", return_value=BookingTurnResolution(action="none"))
+    @patch("apps.agents.services.search_sport_events")
     @patch("apps.agents.services.resolve_turn_filters")
     def test_process_chat_turn_returns_ambiguity_reply_with_candidates(
         self,
         resolve_turn_filters_mock,
+        search_sport_events_mock,
         _invoke_booking_agent_mock,
     ):
         resolve_turn_filters_mock.return_value = TurnResolution(
@@ -695,13 +1545,87 @@ class AgentServiceTests(TestCase):
                 )
             ],
         )
+        search_sport_events_mock.return_value = SearchResult(
+            count=0,
+            limit=5,
+            offset=0,
+            filters={},
+            results=[],
+        )
 
         payload = process_chat_turn(user_message="Show me sports in Delhi")
 
-        self.assertEqual(payload["results_by_domain"], {})
+        self.assertEqual(payload["search_domains"], ["sports"])
+        self.assertEqual(payload["results_by_domain"]["sports"]["count"], 0)
         self.assertTrue(payload["needs_clarification"])
         self.assertEqual(payload["clarification_question"], "Did you mean New Delhi, Delhi NCR?")
         self.assertIn("multiple possible matches", payload["assistant_message"]["content"].lower())
+
+    @patch("apps.agents.services.invoke_booking_agent", return_value=BookingTurnResolution(action="none"))
+    @patch("apps.agents.services.search_sport_events")
+    @patch("apps.agents.services.resolve_turn_filters")
+    def test_process_chat_turn_returns_results_even_with_ambiguity_when_filters_match(
+        self,
+        resolve_turn_filters_mock,
+        search_sport_events_mock,
+        _invoke_booking_agent_mock,
+    ):
+        resolve_turn_filters_mock.return_value = TurnResolution(
+            updates=ActiveFilters(
+                event_types=["sports"],
+                sport_types=["Football"],
+                date_from="2026-04-13",
+            ),
+            tool_trace=["resolve_event_type", "resolve_temporal", "resolve_sport_filters", "resolve_location"],
+            issues=[
+                ResolutionIssue(
+                    status="ambiguous",
+                    trace_name="resolve_location",
+                    filter_label="location",
+                    message="Please specify the city or cities where you want to see upcoming football matches, or confirm if you want matches from all cities.",
+                    candidates=["Ahmedabad", "Bengaluru", "Bhubaneswar", "Chennai"],
+                )
+            ],
+        )
+        search_sport_events_mock.return_value = SearchResult(
+            count=2,
+            limit=5,
+            offset=0,
+            filters={"sport_types": ["Football"], "date_from": "2026-04-13"},
+            results=[
+                {
+                    "listing_code": "SPT-FOOT-001",
+                    "title": "Mumbai City FC vs Mohun Bagan",
+                    "sport_type": "Football",
+                    "city": "Mumbai",
+                    "venue_name": "Mumbai Football Arena",
+                    "event_date": "2026-04-13",
+                    "start_at": "2026-04-13T14:00:00+00:00",
+                    "min_price": 499,
+                    "max_price": 1499,
+                },
+                {
+                    "listing_code": "SPT-FOOT-002",
+                    "title": "Bengaluru FC vs Kerala Blasters",
+                    "sport_type": "Football",
+                    "city": "Bengaluru",
+                    "venue_name": "Sree Kanteerava Stadium",
+                    "event_date": "2026-04-14",
+                    "start_at": "2026-04-14T14:00:00+00:00",
+                    "min_price": 399,
+                    "max_price": 1299,
+                },
+            ],
+        )
+
+        payload = process_chat_turn(user_message="Show me upcoming football matches")
+
+        self.assertEqual(payload["search_domains"], ["sports"])
+        self.assertEqual(payload["results_by_domain"]["sports"]["count"], 2)
+        self.assertTrue(payload["needs_clarification"])
+        self.assertEqual(payload["clarification_question"], "Did you mean Ahmedabad, Bengaluru, Bhubaneswar, Chennai?")
+        self.assertIn("I found football matches", payload["assistant_message"]["content"])
+        self.assertIn("Did you mean Ahmedabad, Bengaluru, Bhubaneswar, Chennai?", payload["assistant_message"]["content"])
 
     @patch("apps.agents.services.invoke_booking_agent", return_value=BookingTurnResolution(action="none"))
     @patch("apps.agents.services.resolve_turn_filters")
@@ -802,6 +1726,109 @@ class AgentServiceTests(TestCase):
 
 
 class AgentLogicTests(TestCase):
+    @patch("apps.agents.langchain_tools._build_goal_state_chain")
+    def test_invoke_goal_state_regrounds_incorrect_movie_summary_for_sports_search(self, build_goal_state_chain_mock):
+        build_goal_state_chain_mock.return_value.invoke.return_value = GoalState(
+            goal_type="search",
+            goal_stage="awaiting_clarification",
+            goal_summary="Movies in Dharamshala",
+            last_open_question="What movie or genre are you interested in?",
+        )
+
+        goal_state = invoke_goal_state(
+            user_message="Show me sports in Dharamshala",
+            assistant_message="I found sports options in Dharamshala.",
+            active_filters={"event_types": ["sports"], "cities": ["Dharamshala"]},
+            latest_result_context={
+                "search_domains": ["sports"],
+                "results": [
+                    {
+                        "listing_code": "SPT-1",
+                        "title": "Punjab Kings vs Delhi Capitals",
+                        "domain": "sports",
+                        "city": "Dharamshala",
+                        "sport_type": "Cricket",
+                    }
+                ],
+            },
+            pending_booking={},
+            search_domains=["sports"],
+            needs_clarification=False,
+            clarification_question=None,
+            booking_action=None,
+            turn_policy_intent="task_continue",
+            existing_goal_state={},
+        )
+
+        self.assertEqual(goal_state.goal_type, "search")
+        self.assertEqual(goal_state.goal_summary, "Sports in Dharamshala")
+
+    @patch("apps.agents.langchain_tools._build_goal_state_chain")
+    def test_invoke_goal_state_prefers_selected_booking_event_summary(self, build_goal_state_chain_mock):
+        build_goal_state_chain_mock.return_value.invoke.return_value = GoalState(
+            goal_type="booking",
+            goal_stage="awaiting_user_info",
+            goal_summary="Sports in New Delhi",
+            last_open_question="Please share your full name.",
+        )
+
+        goal_state = invoke_goal_state(
+            user_message="book this one",
+            assistant_message="Please share your full name to complete the booking.",
+            active_filters={"event_types": ["sports"], "cities": ["New Delhi"], "sport_types": ["Cricket"]},
+            latest_result_context={
+                "search_domains": ["sports"],
+                "results": [],
+            },
+            pending_booking={
+                "listing_code": "SPT-IPL-035",
+                "awaiting_field": "name",
+                "event_snapshot": {
+                    "listing_code": "SPT-IPL-035",
+                    "title": "Punjab Kings vs Delhi Capitals",
+                    "domain": "sports",
+                    "city": "New Delhi",
+                    "venue_name": "Arun Jaitley Stadium",
+                    "event_date": "2026-04-25",
+                },
+            },
+            search_domains=["sports"],
+            needs_clarification=False,
+            clarification_question=None,
+            booking_action="awaiting_user_info",
+            turn_policy_intent="task_continue",
+            existing_goal_state={},
+        )
+
+        self.assertEqual(goal_state.goal_type, "booking")
+        self.assertEqual(
+            goal_state.goal_summary,
+            "Book Punjab Kings vs Delhi Capitals match in New Delhi at Arun Jaitley Stadium on 2026-04-25",
+        )
+
+    @patch("apps.agents.services.generate_dynamic_thread_title")
+    def test_update_dynamic_thread_title_prefers_goal_summary_over_recent_messages(
+        self,
+        generate_dynamic_thread_title_mock,
+    ):
+        thread = ChatThread.objects.create(
+            title="Old title",
+            metadata={
+                "goal_state": {
+                    "goal_type": "search",
+                    "goal_stage": "browsing_results",
+                    "goal_summary": "Football matches in Mumbai",
+                    "last_open_question": "Do you want this weekend or next week?",
+                }
+            },
+        )
+
+        _update_dynamic_thread_title(thread)
+
+        thread.refresh_from_db()
+        self.assertEqual(thread.title, "Football matches in Mumbai")
+        generate_dynamic_thread_title_mock.assert_not_called()
+
     @patch("apps.agents.langchain_tools._invoke_filter_resolution_agent")
     @patch("apps.agents.langchain_tools._build_temporal_agent")
     def test_invoke_temporal_resolver_routes_through_temporal_agent_tools(
@@ -1050,6 +2077,45 @@ class AgentLogicTests(TestCase):
     @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
     @patch("apps.agents.langchain_tools.invoke_location_resolver")
     @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    def test_resolve_turn_filters_clears_city_for_all_cities_follow_up_without_widening_domain(
+        self,
+        event_type_resolver_mock,
+        location_resolver_mock,
+        temporal_resolver_mock,
+        movie_filter_resolver_mock,
+        sport_catalog_inquiry_mock,
+        sport_filter_resolver_mock,
+    ):
+        current_filters = ActiveFilters(
+            event_types=["sports"],
+            cities=["Mumbai"],
+            date_from="2026-04-20",
+            date_to="2026-04-26",
+            sport_types=["Cricket"],
+        )
+        event_type_resolver_mock.return_value = FilterResolution(status="no_input")
+        location_resolver_mock.return_value = FilterResolution(status="resolved", clear_fields=["cities"])
+        temporal_resolver_mock.return_value = FilterResolution(status="no_input")
+        movie_filter_resolver_mock.return_value = FilterResolution(status="no_input")
+        sport_catalog_inquiry_mock.return_value = CatalogInquiry(status="no_input")
+        sport_filter_resolver_mock.return_value = FilterResolution(status="no_input")
+
+        result = resolve_turn_filters(
+            user_message="in all cities, not just mumbai",
+            current_filters=current_filters,
+            reference_date="2026-04-13",
+        )
+
+        self.assertEqual(result.clear_fields, ["cities"])
+        self.assertEqual(result.updates.event_types, [])
+        self.assertEqual(result.updates.sport_types, [])
+
+    @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_sport_catalog_inquiry")
+    @patch("apps.agents.langchain_tools.invoke_movie_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
+    @patch("apps.agents.langchain_tools.invoke_location_resolver")
+    @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
     def test_resolve_turn_filters_does_not_run_sport_catalog_inquiry_for_temporal_follow_up(
         self,
         event_type_resolver_mock,
@@ -1267,6 +2333,61 @@ class BookingStateTests(TestCase):
         self.assertEqual(Booking.objects.get().event_title, "Royal Challengers Bengaluru vs Mumbai Indians")
         thread_filter.refresh_from_db()
         self.assertEqual(thread_filter.pending_booking, {})
+
+    def test_select_thread_pending_booking_preserves_existing_customer_info(self):
+        thread = ChatThread.objects.create(title="Booking thread")
+        thread_filter = ThreadFilter.objects.create(
+            thread=thread,
+            latest_result_context={
+                "thread_id": str(thread.id),
+                "search_domains": ["sports"],
+                "results": [
+                    {
+                        "position": 1,
+                        "domain": "sports",
+                        "listing_code": "SPT-BOOK-1",
+                        "title": "Mumbai Match",
+                        "city": "Mumbai",
+                        "venue_name": "Wankhede Stadium",
+                        "event_date": "2026-04-12",
+                        "start_at": "2026-04-12T19:30:00+05:30",
+                    },
+                    {
+                        "position": 2,
+                        "domain": "sports",
+                        "listing_code": "SPT-BOOK-2",
+                        "title": "Delhi Match",
+                        "city": "New Delhi",
+                        "venue_name": "Arun Jaitley Stadium",
+                        "event_date": "2026-04-13",
+                        "start_at": "2026-04-13T19:30:00+05:30",
+                    },
+                ],
+            },
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-BOOK-1",
+                "awaiting_field": "contact_number",
+                "customer_info": {
+                    "name": "Nandan Kumar",
+                    "email": "nandan@example.com",
+                    "contact_number": "",
+                },
+                "event_snapshot": {"listing_code": "SPT-BOOK-1", "title": "Mumbai Match"},
+            },
+        )
+
+        result = select_thread_pending_booking(thread_filter=thread_filter, listing_code="SPT-BOOK-2")
+
+        self.assertEqual(result["pending_booking"]["listing_code"], "SPT-BOOK-2")
+        self.assertEqual(
+            result["pending_booking"]["customer_info"],
+            {
+                "name": "Nandan Kumar",
+                "email": "nandan@example.com",
+                "contact_number": "",
+            },
+        )
 
 
 class AgentViewTests(TestCase):

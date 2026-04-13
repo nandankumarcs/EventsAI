@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { Plus, Trash2, Check, X } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { Plus, Trash2, Check, X, Ticket } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -61,7 +62,7 @@ export function ThreadSidebar({
 
   return (
     <aside className="flex h-full min-h-0 w-full flex-col bg-muted/30 border-r border-border/50 overflow-hidden">
-      <div className="p-3">
+      <div className="p-3 space-y-2 border-b border-border/40">
         <Button
           type="button"
           variant="outline"
@@ -71,6 +72,17 @@ export function ThreadSidebar({
         >
           <Plus className="size-4" />
           {isCreating ? 'Opening...' : 'New chat'}
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          className="w-full justify-start gap-2 text-muted-foreground hover:bg-accent hover:text-foreground"
+          asChild
+        >
+          <Link to="/bookings">
+            <Ticket className="size-4" />
+            Bookings
+          </Link>
         </Button>
       </div>
 
@@ -136,24 +148,24 @@ export function ThreadSidebar({
             }
 
             return (
-              <div
+              <button
                 key={thread.id}
+                type="button"
+                title={thread.title}
+                onClick={() => onSelectThread(thread.id)}
                 className={cn(
-                  'group flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm transition',
+                  'group flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm transition focus:outline-none',
                   isActive
                     ? 'bg-accent/80 font-medium text-accent-foreground'
                     : 'text-muted-foreground hover:bg-accent/40 hover:text-foreground',
                 )}
               >
-                <button
-                  type="button"
-                  className="flex-1 text-left truncate focus:outline-none"
-                  onClick={() => onSelectThread(thread.id)}
-                >
+                <span className="flex-1 text-left truncate">
                   {thread.title}
-                </button>
-                <button
-                  type="button"
+                </span>
+                <div
+                  role="button"
+                  tabIndex={0}
                   className="ml-2 flex items-center justify-center rounded p-1 opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100 focus:opacity-100 focus:outline-none"
                   onClick={(e) => {
                     e.stopPropagation()
@@ -162,8 +174,8 @@ export function ThreadSidebar({
                   title="Delete chat"
                 >
                   <Trash2 className="size-[14px]" />
-                </button>
-              </div>
+                </div>
+              </button>
             )
           })}
 

@@ -1,7 +1,7 @@
 import { Ticket, Popcorn, Trophy, Calendar, Music, MapPin, Zap, Flame } from 'lucide-react'
 
 export const PROMPT_POOL = [
-  { icon: Popcorn, text: "What action movies are playing nearby this weekend?" },
+  { icon: Popcorn, text: "What action movies are playing this weekend?" },
   { icon: Trophy, text: "Are there any cricket matches in Mumbai next week?" },
   { icon: Ticket, text: "Find comedy shows this weekend" },
   { icon: Calendar, text: "Suggest events under Rs. 1000" },

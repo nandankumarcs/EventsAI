@@ -118,6 +118,8 @@ def mark_thread_pending_booking(*, thread_filter: ThreadFilter, listing_code: st
     if result_match is None:
         raise BookingFlowError("That event is not available in the current thread result context.", status_code=404)
 
+    existing_pending_booking = get_pending_thread_booking(thread_filter=thread_filter)
+    existing_customer_info = existing_pending_booking.get("customer_info", {}) or {}
     pending_booking = {
         "status": "pending_confirmation",
         "listing_code": listing_code,
@@ -125,9 +127,9 @@ def mark_thread_pending_booking(*, thread_filter: ThreadFilter, listing_code: st
         "selected_at": timezone.now().isoformat(),
         "awaiting_field": None,
         "customer_info": {
-            "name": "",
-            "email": "",
-            "contact_number": "",
+            "name": existing_customer_info.get("name", ""),
+            "email": existing_customer_info.get("email", ""),
+            "contact_number": existing_customer_info.get("contact_number", ""),
         },
     }
     thread_filter.pending_booking = pending_booking

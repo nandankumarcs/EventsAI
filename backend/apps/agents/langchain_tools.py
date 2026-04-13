@@ -14,11 +14,13 @@ from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
 
 from apps.agents.schemas import ActiveFilters, BookingTurnResolution, CatalogInquiry, FilterResolution
+from apps.agents.schemas import GoalState, TurnPolicy
 from apps.bookings.services import (
     attempt_thread_pending_booking_confirmation,
     BookingFlowError,
     cancel_thread_pending_booking,
     capture_thread_booking_user_info,
+    FIELD_PROMPTS,
     get_current_thread_result_context,
     get_pending_thread_booking,
     get_thread_booking_context,
@@ -141,7 +143,9 @@ def _build_event_type_agent():
             "You must call get_all_event_types before deciding.\n"
             "Return only canonical values returned by that tool in active_filters_partial.event_types.\n"
             "Do not invent labels. Do not explain outside the schema.\n"
-            "If the user did not express a clear event type, return status no_input."
+            "If the user did not express a clear event type in the current message, return status no_input.\n"
+            "Pure location, date, time, venue, or other filter corrections such as 'Actually Mumbai again', 'No wait Pune', 'Delhi instead', or 'this week not Sunday' are not event-type changes and must return no_input.\n"
+            "Do not widen the current domain just because multiple event types exist in the catalog.\n"
         ),
     )
 
@@ -170,6 +174,7 @@ def _build_location_agent():
             "Map informal wording to the closest canonical city only when it is clearly the user's intent.\n"
             "Do not return lowercase variants. Do not invent cities. Do not infer venues or teams from a city mention.\n"
             "If the user asks to remove, exclude, or go outside the current city filter, return status resolved with clear_fields set to ['cities'] and leave active_filters_partial.cities empty.\n"
+            "If the user says 'all cities', 'any city', 'not just Mumbai', 'not only Mumbai', 'across all cities', or otherwise broadens beyond the current city restriction, return status resolved with clear_fields set to ['cities'] and leave active_filters_partial.cities empty.\n"
             "If the user replaces one city with another, return only the replacement city value.\n"
         ),
     )
@@ -525,100 +530,454 @@ def _booking_tools():
 
 
 @lru_cache(maxsize=1)
-def _build_booking_selection_agent():
-    tools = _booking_tools()
+def _build_booking_selection_chain():
+    llm = get_chat_model(resolver=True)
+    structured_llm = llm.with_structured_output(BookingTurnResolution)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You handle conversational event selection for booking inside an event booking thread.\n"
+                "There is no pending booking before this turn.\n"
+                "The user message is provided as JSON with user_message, active_filters, and latest_result_context.\n"
+                "Use only latest_result_context.results to resolve references like 'book the second one', 'book the Mumbai one', 'book Kalki', or 'book the Chennai match'. Never invent or search outside it.\n"
+                "Treat direct selection phrases as booking-selection requests, including examples like 'book the first one', 'pick the one in Guwahati', 'reserve Kalki', 'पहला वाला बुक करो', and 'इसको बुक करो'. Returning action none for those requests is incorrect.\n"
+                "If the user is changing the search instead of choosing a visible result, return action none.\n"
+                "Messages like 'Actually Mumbai again', 'No wait Pune', 'Delhi instead', 'this week not Sunday', 'Show cricket matches', 'show movies instead', or 'Bengaluru nahi Chennai' are search changes, not booking-selection requests, unless the user explicitly asks to book or pick a visible result.\n"
+                "Do not treat a city, date, domain, or filter correction as a failed attempt to book from the currently visible results.\n"
+                "If you can identify exactly one result, return action selection_pending with that listing_code.\n"
+                "Never confirm a booking in this step. Never ask for user info in this step. Stop after selection and ask for confirmation.\n"
+                "If the user confirms before selecting an event, return action no_match with a message telling them to choose an event first.\n"
+                "If the message is not a booking-selection request, return action none.\n"
+                "If multiple results could match, return action ambiguous with candidates and a clarification message.\n"
+                "If the requested event cannot be matched to the current thread context, return action no_match.\n"
+                "This step must work for multilingual or mixed-language user input too.\n"
+                "Return a concise user-facing message in all handled actions.\n"
+                "Do not invent listing codes."
+            ),
+            ("user", "{payload}"),
+        ]
+    )
+    return prompt | structured_llm
 
-    return create_react_agent(
-        model=get_chat_model(resolver=True),
-        tools=[
-            tools["thread_booking_context"],
-            tools["mark_pending_booking"],
-        ],
-        response_format=BookingTurnResolution,
-        prompt=(
-            "You handle conversational event selection for booking inside an event booking thread.\n"
-            "There is no pending booking before this turn.\n"
-            "The user message is provided as JSON with thread_id and user_message.\n"
-            "You must call get_thread_booking_context first.\n"
-            "Use only latest_result_context.results from that tool to resolve references like 'book the second one', 'book the Mumbai one', 'book Kalki', or 'book the Chennai match'. Never invent or search outside it.\n"
-            "Treat direct selection phrases as booking-selection requests, including examples like 'book the first one', 'pick the one in Guwahati', 'reserve Kalki', 'पहला वाला बुक करो', and 'इसको बुक करो'. Returning action none for those requests is incorrect.\n"
-            "If you can identify exactly one result, call mark_thread_pending_booking and return action selection_pending with listing_code and selected_event from the tool response.\n"
-            "Never confirm a booking in this agent. Never ask for user info in this agent. Stop after selection and ask for confirmation.\n"
-            "If the user confirms before selecting an event, return action no_match with a message telling them to choose an event first.\n"
-            "If the message is not a booking-selection request, return action none.\n"
-            "If multiple results could match, return action ambiguous with candidates and a clarification message.\n"
-            "If the requested event cannot be matched to the current thread context, return action no_match.\n"
-            "This agent must work for multilingual or mixed-language user input too.\n"
-            "Return a concise user-facing message in all handled actions.\n"
-        ),
+
+def _invoke_booking_selection_resolution(*, thread_id: str, user_message: str) -> BookingTurnResolution:
+    _thread, thread_filter = _get_booking_thread_state(thread_id)
+
+    try:
+        response = _build_booking_selection_chain().invoke(
+            {
+                "payload": json.dumps(
+                    {
+                        "user_message": user_message,
+                        "active_filters": thread_filter.active_filters or {},
+                        "latest_result_context": thread_filter.latest_result_context or {},
+                    }
+                )
+            }
+        )
+    except Exception as exc:
+        logger.warning("resolve_booking_selection failed: %s", exc)
+        return BookingTurnResolution(action="none")
+
+    if isinstance(response, BookingTurnResolution):
+        resolution = response
+    else:
+        try:
+            resolution = BookingTurnResolution.model_validate(response)
+        except Exception as exc:
+            logger.warning("resolve_booking_selection returned invalid structured response: %s", exc)
+            return BookingTurnResolution(action="none")
+
+    if resolution.action != "selection_pending":
+        return resolution
+
+    listing_code = resolution.listing_code.strip()
+    if not listing_code:
+        logger.warning("resolve_booking_selection returned selection_pending without listing_code")
+        return BookingTurnResolution(
+            action="no_match",
+            message="Please choose one of the currently visible events to continue the booking.",
+        )
+
+    try:
+        selected = select_thread_pending_booking(thread_filter=thread_filter, listing_code=listing_code)
+    except BookingFlowError as exc:
+        return BookingTurnResolution(action="no_match", message=str(exc))
+
+    pending_booking = selected.get("pending_booking", {})
+    return BookingTurnResolution(
+        action="selection_pending",
+        message=resolution.message or "I selected that event. Reply yes to confirm it or no to clear it.",
+        listing_code=pending_booking.get("listing_code", listing_code),
+        selected_event=pending_booking.get("event_snapshot", {}),
+        booking={},
+        candidates=[],
     )
 
 
 @lru_cache(maxsize=1)
-def _build_booking_confirmation_agent():
-    tools = _booking_tools()
-
-    return create_react_agent(
-        model=get_chat_model(resolver=True),
-        tools=[
-            tools["thread_booking_context"],
-            tools["mark_pending_booking"],
-            tools["clear_pending_booking"],
-            tools["confirm_pending_booking"],
-        ],
-        response_format=BookingTurnResolution,
-        prompt=(
-            "You handle booking confirmation for a thread that already has a pending booking awaiting confirmation.\n"
-            "The user message is provided as JSON with thread_id and user_message.\n"
-            "You must call get_thread_booking_context first so you know the selected event, active filters, and latest results.\n"
-            "If the user says yes, confirm, go ahead, or otherwise approves the selected event in any language, call confirm_thread_pending_booking.\n"
-            "If that tool returns status confirmed, return action booking_confirmed with the booking payload.\n"
-            "If that tool returns status missing_user_info, return action awaiting_user_info with requested_field and the prompt message from the tool.\n"
-            "If the user explicitly rejects or cancels the selected event, call clear_thread_pending_booking and return action booking_cleared.\n"
-            "If the user asks to book a different visible result, resolve it only from latest_result_context.results in get_thread_booking_context, call mark_thread_pending_booking, and return action selection_pending.\n"
-            "If the user is changing the search instead of confirming the booking, return action none so the normal search flow can continue.\n"
-            "Treat requests like 'show football instead', 'show movies instead', 'Mumbai nahi Delhi', 'in Bengaluru instead', or 'this week not Sunday' as search changes, not booking cancellation.\n"
-            "Treat only explicit cancellation phrases like 'cancel this booking', 'don't book this', 'not this one', 'नहीं इसे बुक मत करो', or 'बुकिंग रद्द करो' as booking_cleared.\n"
-            "If multiple results could match, return action ambiguous with candidates and a clarification message.\n"
-            "If the requested event cannot be matched to the current thread context, return action no_match.\n"
-            "This agent must work for multilingual or mixed-language user input too.\n"
-            "Return a concise user-facing message in all handled actions.\n"
-        ),
+def _build_booking_confirmation_chain():
+    llm = get_chat_model(resolver=True)
+    structured_llm = llm.with_structured_output(BookingTurnResolution)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You handle booking confirmation for a thread that already has a pending booking awaiting confirmation.\n"
+                "The user message is provided as JSON with user_message, active_filters, pending_booking, missing_fields, and latest_result_context.\n"
+                "If the user says yes, confirm, go ahead, or otherwise approves the selected event in any language, return action booking_confirmed.\n"
+                "If the selected event still needs user details first, still return booking_confirmed. The application will decide whether confirmation can proceed or if user info is missing.\n"
+                "If the user explicitly rejects or cancels the selected event, return action booking_cleared.\n"
+                "If the user says they want a different movie, different event, different match, another option, or wants to pick again without naming a replacement yet, return action booking_cleared so the app can restore the current results and let them choose again.\n"
+                "Examples include 'I want a different movie', 'show me other movies', 'another one', 'not this, something else', 'different match', or 'pick a different one'.\n"
+                "If the user asks to book a different visible result, resolve it only from latest_result_context.results and return action selection_pending with the chosen listing_code.\n"
+                "If the user is changing the search instead of confirming the booking, return action none so the normal search flow can continue.\n"
+                "Treat requests like 'show football instead', 'show movies instead', 'Mumbai nahi Delhi', 'in Bengaluru instead', or 'this week not Sunday' as search changes, not booking cancellation.\n"
+                "Treat only explicit cancellation phrases like 'cancel this booking', 'don't book this', 'not this one', 'नहीं इसे बुक मत करो', or 'बुकिंग रद्द करो' as booking_cleared.\n"
+                "If multiple visible results could match, return action ambiguous with candidates and a clarification message.\n"
+                "If the requested event cannot be matched to the current thread context, return action no_match.\n"
+                "This step must work for multilingual or mixed-language user input too.\n"
+                "Return a concise user-facing message in all handled actions.\n"
+                "Do not invent listing codes."
+            ),
+            ("user", "{payload}"),
+        ]
     )
+    return prompt | structured_llm
+
+
+def _invoke_booking_confirmation_resolution(*, thread_id: str, user_message: str) -> BookingTurnResolution:
+    thread, thread_filter = _get_booking_thread_state(thread_id)
+    context = get_thread_booking_context(thread_filter=thread_filter)
+
+    try:
+        response = _build_booking_confirmation_chain().invoke(
+            {
+                "payload": json.dumps(
+                    {
+                        "user_message": user_message,
+                        "active_filters": context.get("active_filters", {}),
+                        "pending_booking": context.get("pending_booking", {}),
+                        "missing_fields": context.get("missing_fields", []),
+                        "latest_result_context": context.get("latest_result_context", {}),
+                    }
+                )
+            }
+        )
+    except Exception as exc:
+        logger.warning("resolve_booking_confirmation failed: %s", exc)
+        return BookingTurnResolution(action="none")
+
+    if isinstance(response, BookingTurnResolution):
+        resolution = response
+    else:
+        try:
+            resolution = BookingTurnResolution.model_validate(response)
+        except Exception as exc:
+            logger.warning("resolve_booking_confirmation returned invalid structured response: %s", exc)
+            return BookingTurnResolution(action="none")
+
+    if resolution.action == "selection_pending":
+        listing_code = resolution.listing_code.strip()
+        if not listing_code:
+            return BookingTurnResolution(
+                action="no_match",
+                message="Please choose one of the currently visible events to continue the booking.",
+            )
+        try:
+            selected = select_thread_pending_booking(thread_filter=thread_filter, listing_code=listing_code)
+        except BookingFlowError as exc:
+            return BookingTurnResolution(action="no_match", message=str(exc))
+        pending_booking = selected.get("pending_booking", {})
+        return BookingTurnResolution(
+            action="selection_pending",
+            message=resolution.message or "I selected that event. Reply yes to confirm it or no to clear it.",
+            listing_code=pending_booking.get("listing_code", listing_code),
+            selected_event=pending_booking.get("event_snapshot", {}),
+            booking={},
+            candidates=[],
+        )
+
+    if resolution.action == "booking_cleared":
+        cancel_thread_pending_booking(thread_filter=thread_filter)
+        return BookingTurnResolution(
+            action="booking_cleared",
+            message=resolution.message or "Okay, I cleared that booking selection.",
+        )
+
+    if resolution.action == "booking_confirmed":
+        try:
+            confirmation = attempt_thread_pending_booking_confirmation(
+                thread=thread,
+                thread_filter=thread_filter,
+                confirmed_via="chat_message",
+                append_confirmation_message=False,
+            )
+        except BookingFlowError as exc:
+            return BookingTurnResolution(action="no_match", message=str(exc))
+
+        if confirmation["status"] == "confirmed":
+            return BookingTurnResolution(
+                action="booking_confirmed",
+                message=resolution.message or "Your booking is confirmed.",
+                listing_code=thread_filter.pending_booking.get("listing_code", ""),
+                booking=confirmation["booking"],
+            )
+
+        pending_booking = confirmation["pending_booking"]
+        return BookingTurnResolution(
+            action="awaiting_user_info",
+            message=confirmation["message"],
+            listing_code=pending_booking.get("listing_code", ""),
+            requested_field=confirmation["next_required_field"],
+            selected_event=pending_booking.get("event_snapshot", {}),
+            booking={
+                "thread_id": str(thread.id),
+                "event_type": pending_booking.get("event_snapshot", {}).get("domain", ""),
+                "status": pending_booking.get("status", ""),
+                "event_title": pending_booking.get("event_snapshot", {}).get("title", ""),
+                "customer_name": pending_booking.get("customer_info", {}).get("name", ""),
+                "customer_email": pending_booking.get("customer_info", {}).get("email", ""),
+                "customer_contact_number": pending_booking.get("customer_info", {}).get("contact_number", ""),
+                "city": pending_booking.get("event_snapshot", {}).get("city", ""),
+                "venue_name": pending_booking.get("event_snapshot", {}).get("venue_name", ""),
+                "starts_at": pending_booking.get("event_snapshot", {}).get("start_at", ""),
+            },
+        )
+
+    return resolution
 
 
 @lru_cache(maxsize=1)
-def _build_booking_user_info_agent():
-    tools = _booking_tools()
-
-    return create_react_agent(
-        model=get_chat_model(resolver=True),
-        tools=[
-            tools["thread_booking_context"],
-            tools["clear_pending_booking"],
-            tools["save_pending_booking_user_info"],
-            tools["confirm_pending_booking"],
-        ],
-        response_format=BookingTurnResolution,
-        prompt=(
-            "You handle the missing-user-info stage for a pending booking.\n"
-            "The user message is provided as JSON with thread_id and user_message.\n"
-            "You must call get_thread_booking_context first and inspect pending_booking.awaiting_field and missing_fields.\n"
-            "If the user provides the missing value for pending_booking.awaiting_field in any language, call save_thread_booking_user_info with that exact field name and the raw user value.\n"
-            "If save_thread_booking_user_info returns status invalid_user_info, return action awaiting_user_info with the validation message and keep requested_field on the same field.\n"
-            "Then call confirm_thread_pending_booking.\n"
-            "If the confirm tool returns status confirmed, return action booking_confirmed with the booking payload.\n"
-            "If it returns status missing_user_info, return action awaiting_user_info with the next requested_field and prompt message.\n"
-            "If the user explicitly rejects or cancels the pending booking, call clear_thread_pending_booking and return action booking_cleared.\n"
-            "If the user is clearly changing the search instead of answering the awaited field, return action none so the normal search flow can continue.\n"
-            "Treat messages like 'show football instead', 'movies instead', 'Mumbai nahi Delhi', 'this week not Sunday', or 'kal ka dikhana' as search changes. Do not clear the booking for those; return action none.\n"
-            "Treat only explicit cancellation phrases like 'cancel this booking', 'don't book this', 'not this one', 'नहीं इसे बुक मत करो', or 'बुकिंग रद्द करो' as booking_cleared.\n"
-            "Examples of valid awaited-field answers include names, emails, and phone numbers in any language or script, such as 'Nandan Kumar', 'नंदन कुमार', 'nandan@example.com', or '9876543210'.\n"
-            "If the message is unrelated to the awaited field and not a search change, return action awaiting_user_info with the current requested_field and remind the user what is still needed.\n"
-            "This agent must work for multilingual or mixed-language user input too.\n"
-            "Return a concise user-facing message in all handled actions.\n"
-        ),
+def _build_booking_user_info_chain():
+    llm = get_chat_model(resolver=True)
+    structured_llm = llm.with_structured_output(BookingTurnResolution)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You handle the missing-user-info stage for a pending booking.\n"
+                "The user message is provided as JSON with user_message, active_filters, pending_booking, missing_fields, and latest_result_context.\n"
+                "Inspect pending_booking.awaiting_field and missing_fields.\n"
+                "If the user provides the missing value for pending_booking.awaiting_field in any language, return action booking_confirmed and place the raw user value in message exactly as provided.\n"
+                "The application will validate and save that value, then decide whether more fields are needed or the booking can be confirmed.\n"
+                "If the user wants to switch to a different visible result, resolve it only from latest_result_context.results and return action selection_pending with the newly selected listing_code.\n"
+                "When the user switches events, do not treat it as a cancellation. The booking remains in progress with the new selected event.\n"
+                "If the user explicitly rejects or cancels the pending booking, return action booking_cleared.\n"
+                "If the user says they want a different movie, different event, different match, another option, or wants to pick again without naming a replacement yet, return action booking_cleared so the app can restore the current results and let them choose again.\n"
+                "Examples include 'I want a different movie', 'show me other movies', 'another one', 'not this, something else', 'different match', or 'pick a different one'.\n"
+                "If the user is clearly changing the search instead of answering the awaited field, return action none so the normal search flow can continue.\n"
+                "Treat messages like 'show football instead', 'movies instead', 'Mumbai nahi Delhi', 'this week not Sunday', or 'kal ka dikhana' as search changes. Do not clear the booking for those; return action none.\n"
+                "Treat only explicit cancellation phrases like 'cancel this booking', 'don't book this', 'not this one', 'नहीं इसे बुक मत करो', or 'बुकिंग रद्द करो' as booking_cleared.\n"
+                "Examples of valid awaited-field answers include names, emails, and phone numbers in any language or script, such as 'Nandan Kumar', 'नंदन कुमार', 'nandan@example.com', or '9876543210'.\n"
+                "If the message is unrelated to the awaited field and not a search change, return action awaiting_user_info with requested_field set to the current awaited field and remind the user what is still needed.\n"
+                "This step must work for multilingual or mixed-language user input too.\n"
+                "Return a concise user-facing message in all handled actions.\n"
+                "Do not invent listing codes."
+            ),
+            ("user", "{payload}"),
+        ]
     )
+    return prompt | structured_llm
+
+
+def _invoke_booking_user_info_resolution(*, thread_id: str, user_message: str) -> BookingTurnResolution:
+    thread, thread_filter = _get_booking_thread_state(thread_id)
+    context = get_thread_booking_context(thread_filter=thread_filter)
+    pending_booking = context.get("pending_booking", {})
+    awaited_field = str(pending_booking.get("awaiting_field", "") or "")
+
+    try:
+        response = _build_booking_user_info_chain().invoke(
+            {
+                "payload": json.dumps(
+                    {
+                        "user_message": user_message,
+                        "active_filters": context.get("active_filters", {}),
+                        "pending_booking": pending_booking,
+                        "missing_fields": context.get("missing_fields", []),
+                        "latest_result_context": context.get("latest_result_context", {}),
+                    }
+                )
+            }
+        )
+    except Exception as exc:
+        logger.warning("resolve_booking_user_info failed: %s", exc)
+        return BookingTurnResolution(action="none")
+
+    if isinstance(response, BookingTurnResolution):
+        resolution = response
+    else:
+        try:
+            resolution = BookingTurnResolution.model_validate(response)
+        except Exception as exc:
+            logger.warning("resolve_booking_user_info returned invalid structured response: %s", exc)
+            return BookingTurnResolution(action="none")
+
+    if resolution.action == "selection_pending":
+        listing_code = resolution.listing_code.strip()
+        if not listing_code:
+            return BookingTurnResolution(
+                action="no_match",
+                message="Please choose one of the currently visible events to continue the booking.",
+            )
+        try:
+            selected = select_thread_pending_booking(thread_filter=thread_filter, listing_code=listing_code)
+        except BookingFlowError as exc:
+            return BookingTurnResolution(action="no_match", message=str(exc))
+        pending_booking = selected.get("pending_booking", {})
+        return BookingTurnResolution(
+            action="selection_pending",
+            message=resolution.message or "I selected that event. Reply yes to confirm it or no to clear it.",
+            listing_code=pending_booking.get("listing_code", listing_code),
+            selected_event=pending_booking.get("event_snapshot", {}),
+            booking={},
+            candidates=[],
+        )
+
+    if resolution.action == "booking_cleared":
+        cancel_thread_pending_booking(thread_filter=thread_filter)
+        return BookingTurnResolution(
+            action="booking_cleared",
+            message=resolution.message or "Okay, I cleared that booking selection.",
+        )
+
+    if resolution.action == "booking_confirmed":
+        raw_value = user_message.strip()
+        if not awaited_field:
+            return BookingTurnResolution(action="none")
+
+        saved = capture_thread_booking_user_info(
+            thread_filter=thread_filter,
+            field_name=awaited_field,
+            value=raw_value,
+        )
+        if saved["status"] == "invalid_user_info":
+            return BookingTurnResolution(
+                action="awaiting_user_info",
+                message=saved["message"],
+                listing_code=pending_booking.get("listing_code", ""),
+                requested_field=awaited_field,
+                selected_event=pending_booking.get("event_snapshot", {}),
+                booking={},
+            )
+
+        try:
+            confirmation = attempt_thread_pending_booking_confirmation(
+                thread=thread,
+                thread_filter=thread_filter,
+                confirmed_via="chat_message",
+                append_confirmation_message=False,
+            )
+        except BookingFlowError as exc:
+            return BookingTurnResolution(action="no_match", message=str(exc))
+
+        if confirmation["status"] == "confirmed":
+            latest_pending = thread_filter.pending_booking or {}
+            booking_payload = confirmation["booking"]
+            confirmation_message = (
+                f"Booking confirmed for {booking_payload['event_title']} in {booking_payload['city']} at "
+                f"{booking_payload['venue_name']}. Your reference is {booking_payload['booking_reference']}."
+            )
+            return BookingTurnResolution(
+                action="booking_confirmed",
+                message=confirmation_message,
+                listing_code=latest_pending.get("listing_code", ""),
+                booking=booking_payload,
+            )
+
+        updated_pending = confirmation["pending_booking"]
+        return BookingTurnResolution(
+            action="awaiting_user_info",
+            message=confirmation["message"],
+            listing_code=updated_pending.get("listing_code", ""),
+            requested_field=confirmation["next_required_field"],
+            selected_event=updated_pending.get("event_snapshot", {}),
+            booking={
+                "thread_id": str(thread.id),
+                "event_type": updated_pending.get("event_snapshot", {}).get("domain", ""),
+                "status": updated_pending.get("status", ""),
+                "event_title": updated_pending.get("event_snapshot", {}).get("title", ""),
+                "customer_name": updated_pending.get("customer_info", {}).get("name", ""),
+                "customer_email": updated_pending.get("customer_info", {}).get("email", ""),
+                "customer_contact_number": updated_pending.get("customer_info", {}).get("contact_number", ""),
+                "city": updated_pending.get("event_snapshot", {}).get("city", ""),
+                "venue_name": updated_pending.get("event_snapshot", {}).get("venue_name", ""),
+                "starts_at": updated_pending.get("event_snapshot", {}).get("start_at", ""),
+            },
+        )
+
+    if resolution.action == "awaiting_user_info":
+        return BookingTurnResolution(
+            action="awaiting_user_info",
+            message=resolution.message or FIELD_PROMPTS.get(awaited_field, "Please share the requested booking detail."),
+            listing_code=pending_booking.get("listing_code", ""),
+            requested_field=resolution.requested_field or awaited_field,
+            selected_event=pending_booking.get("event_snapshot", {}),
+            booking={},
+        )
+
+    return resolution
+
+
+@lru_cache(maxsize=1)
+def _build_turn_policy_chain():
+    llm = get_chat_model(resolver=True)
+    structured_llm = llm.with_structured_output(TurnPolicy)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You route conversational turns for an event discovery and booking assistant.\n"
+                "The user message is provided as JSON with user_message, current_filters, pending_booking, latest_result_context, and goal_state.\n"
+                "Return intent task_continue when the message should be handled by the normal search, filter, selection, booking confirmation, or booking user-info flows.\n"
+                "That includes event changes, filter changes, booking changes, and follow-up questions about currently shown events.\n"
+                "Return search_change when the user is changing filters, dates, domains, locations, or other search constraints.\n"
+                "Standalone corrections like 'Actually Mumbai again', 'No wait Pune', 'Delhi instead', 'this week not Sunday', or 'Show cricket matches' after movie results are search_change turns, even when current results are visible.\n"
+                "Only prefer booking-related intents when the user is explicitly trying to book, pick, reserve, confirm, cancel, or provide missing booking details.\n"
+                "Return booking_change when the user is changing which visible event they want to book while a booking is in progress.\n"
+                "Return follow_up_about_results when the user is asking about the current visible results rather than changing the search.\n"
+                "Return temporary_distraction when the message is small talk, a joke request, casual banter, or a brief detour but the conversation should be softly guided back to the current event-planning task.\n"
+                "Return out_of_scope when the user requests something unrelated to event discovery or booking, such as writing poems or doing unrelated work.\n"
+                "Return meta_help when the user is asking how the assistant works or what it can do in the current planning context.\n"
+                "Set should_keep_results true when there is enough current planning context that the assistant should keep showing the current event results while softly redirecting.\n"
+                "For temporary_distraction, out_of_scope, or meta_help, message must be a concise user-facing soft redirection that acknowledges the detour and guides the user back to the active planning task or pending booking.\n"
+                "Do not answer the off-topic request in full. Keep the redirect concise, supportive, and focused on the saved goal_state when available.\n"
+                "Do not invent filters or results."
+            ),
+            ("user", "{payload}"),
+        ]
+    )
+    return prompt | structured_llm
+
+
+@lru_cache(maxsize=1)
+def _build_goal_state_chain():
+    llm = get_chat_model(resolver=True)
+    structured_llm = llm.with_structured_output(GoalState)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You maintain the active planning goal state for an event discovery and booking assistant.\n"
+                "You are given JSON with the latest completed turn: user_message, assistant_message, active_filters, latest_result_context, pending_booking, search_domains, needs_clarification, clarification_question, booking_action, turn_policy_intent, and existing_goal_state.\n"
+                "Return the single active goal after this turn.\n"
+                "Use goal_type search when the user is browsing or refining events. Use booking when a booking is selected, being confirmed, or collecting user info. Use none only when there is no meaningful active planning context.\n"
+                "Use goal_stage browsing_results for active event exploration with grounded results or filters, awaiting_clarification when the assistant still needs a missing clarification, pending_confirmation when an event is selected and awaiting yes/no, awaiting_user_info when the booking still needs customer details, and booking_confirmed when confirmation is complete.\n"
+                "goal_summary must be a short user-facing summary of the active goal, such as 'Football matches in Mumbai' or 'Book Sunrisers Hyderabad vs Punjab Kings'.\n"
+                "goal_summary must stay grounded in active_filters, search_domains, and pending_booking.\n"
+                "If the active domain is sports, do not summarize the goal as movies.\n"
+                "If the active domain is movies, do not summarize the goal as sports or matches.\n"
+                "If pending_booking is present, prefer the selected event as the anchor for the goal summary.\n"
+                "last_open_question should capture the next question or missing information the assistant expects from the user. Leave it empty only when nothing actionable is pending.\n"
+                "If the latest turn was a temporary distraction or out_of_scope detour but the existing planning context remains active, preserve the underlying goal instead of replacing it with the distraction.\n"
+                "Do not summarize the distraction itself as the goal."
+            ),
+            ("user", "{payload}"),
+        ]
+    )
+    return prompt | structured_llm
 
 
 def invoke_event_type_resolver(user_message: str) -> FilterResolution:
@@ -772,11 +1131,11 @@ def invoke_booking_agent(*, thread_id: str, user_message: str) -> BookingTurnRes
     awaiting_field = pending_booking.get("awaiting_field")
     has_pending_selection = bool(pending_booking.get("listing_code"))
     if awaiting_field:
-        agent = _build_booking_user_info_agent()
+        return _invoke_booking_user_info_resolution(thread_id=thread_id, user_message=user_message)
     elif has_pending_selection:
-        agent = _build_booking_confirmation_agent()
+        return _invoke_booking_confirmation_resolution(thread_id=thread_id, user_message=user_message)
     else:
-        agent = _build_booking_selection_agent()
+        return _invoke_booking_selection_resolution(thread_id=thread_id, user_message=user_message)
 
     try:
         response = agent.invoke(
@@ -811,6 +1170,205 @@ def invoke_booking_agent(*, thread_id: str, user_message: str) -> BookingTurnRes
             logger.warning("resolve_booking_turn returned invalid structured response: %s", exc)
 
     return BookingTurnResolution(action="none")
+
+
+def invoke_turn_policy(
+    *,
+    user_message: str,
+    current_filters: ActiveFilters,
+    pending_booking: dict[str, object] | None = None,
+    latest_result_context: dict[str, object] | None = None,
+    goal_state: dict[str, object] | None = None,
+) -> TurnPolicy:
+    try:
+        response = _build_turn_policy_chain().invoke(
+            {
+                "payload": json.dumps(
+                    {
+                        "user_message": user_message,
+                        "current_filters": current_filters.model_dump(),
+                        "pending_booking": pending_booking or {},
+                        "latest_result_context": latest_result_context or {},
+                        "goal_state": goal_state or {},
+                    }
+                )
+            }
+        )
+    except Exception as exc:
+        logger.warning("resolve_turn_policy failed: %s", exc)
+        return TurnPolicy(intent="task_continue")
+
+    if isinstance(response, TurnPolicy):
+        return response
+    try:
+        return TurnPolicy.model_validate(response)
+    except Exception as exc:
+        logger.warning("resolve_turn_policy returned invalid structured response: %s", exc)
+        return TurnPolicy(intent="task_continue")
+
+
+def invoke_goal_state(
+    *,
+    user_message: str,
+    assistant_message: str,
+    active_filters: dict[str, object],
+    latest_result_context: dict[str, object] | None,
+    pending_booking: dict[str, object] | None,
+    search_domains: list[str],
+    needs_clarification: bool,
+    clarification_question: str | None,
+    booking_action: str | None,
+    turn_policy_intent: str,
+    existing_goal_state: dict[str, object] | None = None,
+) -> GoalState:
+    try:
+        response = _build_goal_state_chain().invoke(
+            {
+                "payload": json.dumps(
+                    {
+                        "user_message": user_message,
+                        "assistant_message": assistant_message,
+                        "active_filters": active_filters,
+                        "latest_result_context": latest_result_context or {},
+                        "pending_booking": pending_booking or {},
+                        "search_domains": search_domains,
+                        "needs_clarification": needs_clarification,
+                        "clarification_question": clarification_question,
+                        "booking_action": booking_action,
+                        "turn_policy_intent": turn_policy_intent,
+                        "existing_goal_state": existing_goal_state or {},
+                    }
+                )
+            }
+        )
+    except Exception as exc:
+        logger.warning("resolve_goal_state failed: %s", exc)
+        return _ground_goal_state(
+            GoalState.model_validate(existing_goal_state or {}),
+            active_filters=active_filters,
+            latest_result_context=latest_result_context,
+            pending_booking=pending_booking,
+            search_domains=search_domains,
+            clarification_question=clarification_question,
+        )
+
+    if isinstance(response, GoalState):
+        return _ground_goal_state(
+            response,
+            active_filters=active_filters,
+            latest_result_context=latest_result_context,
+            pending_booking=pending_booking,
+            search_domains=search_domains,
+            clarification_question=clarification_question,
+        )
+    try:
+        return _ground_goal_state(
+            GoalState.model_validate(response),
+            active_filters=active_filters,
+            latest_result_context=latest_result_context,
+            pending_booking=pending_booking,
+            search_domains=search_domains,
+            clarification_question=clarification_question,
+        )
+    except Exception as exc:
+        logger.warning("resolve_goal_state returned invalid structured response: %s", exc)
+        return _ground_goal_state(
+            GoalState.model_validate(existing_goal_state or {}),
+            active_filters=active_filters,
+            latest_result_context=latest_result_context,
+            pending_booking=pending_booking,
+            search_domains=search_domains,
+            clarification_question=clarification_question,
+        )
+
+
+def _ground_goal_state(
+    goal_state: GoalState,
+    *,
+    active_filters: dict[str, object],
+    latest_result_context: dict[str, object] | None,
+    pending_booking: dict[str, object] | None,
+    search_domains: list[str],
+    clarification_question: str | None,
+) -> GoalState:
+    pending_booking = pending_booking or {}
+    active_filters = active_filters or {}
+    latest_result_context = latest_result_context or {}
+
+    normalized = goal_state.model_copy(deep=True)
+    grounded_summary = _build_grounded_goal_summary(
+        active_filters=active_filters,
+        latest_result_context=latest_result_context,
+        pending_booking=pending_booking,
+        search_domains=search_domains,
+    )
+
+    if pending_booking.get("listing_code"):
+        normalized.goal_type = "booking"
+        if grounded_summary:
+            normalized.goal_summary = grounded_summary
+        if normalized.goal_stage == "no_goal":
+            normalized.goal_stage = "awaiting_user_info" if pending_booking.get("awaiting_field") else "pending_confirmation"
+        if not normalized.last_open_question:
+            normalized.last_open_question = clarification_question or ""
+        return normalized
+
+    if search_domains:
+        normalized.goal_type = "search"
+        if grounded_summary:
+            normalized.goal_summary = grounded_summary
+        if normalized.goal_stage == "no_goal":
+            normalized.goal_stage = "awaiting_clarification" if clarification_question else "browsing_results"
+        if not normalized.last_open_question and clarification_question:
+            normalized.last_open_question = clarification_question
+        return normalized
+
+    return normalized
+
+
+def _build_grounded_goal_summary(
+    *,
+    active_filters: dict[str, object],
+    latest_result_context: dict[str, object],
+    pending_booking: dict[str, object],
+    search_domains: list[str],
+) -> str:
+    event_snapshot = pending_booking.get("event_snapshot", {}) if pending_booking else {}
+    if event_snapshot.get("listing_code"):
+        domain = str(event_snapshot.get("domain", "")).strip()
+        title = str(event_snapshot.get("title", "")).strip()
+        city = str(event_snapshot.get("city", "")).strip()
+        venue_name = str(event_snapshot.get("venue_name", "")).strip()
+        event_date = str(event_snapshot.get("event_date", "")).strip()
+        domain_label = "movie" if domain == "movies" else "match" if domain == "sports" else "event"
+        parts = [f"Book {title} {domain_label}".strip()]
+        if city:
+            parts.append(f"in {city}")
+        if venue_name:
+            parts.append(f"at {venue_name}")
+        if event_date:
+            parts.append(f"on {event_date}")
+        return " ".join(part for part in parts if part).strip()
+
+    domains = search_domains or list(active_filters.get("event_types", []) or [])
+    cities = list(active_filters.get("cities", []) or [])
+    sport_types = list(active_filters.get("sport_types", []) or [])
+
+    if domains == ["sports"]:
+        if sport_types and cities:
+            return f"{sport_types[0]} matches in {cities[0]}"
+        if sport_types:
+            return f"{sport_types[0]} matches"
+        if cities:
+            return f"Sports in {cities[0]}"
+        return "Sports events"
+
+    if domains == ["movies"]:
+        if cities:
+            return f"Movies in {cities[0]}"
+        return "Movies"
+
+    return ""
 
 
 def resolve_turn_filters(

@@ -39,6 +39,34 @@ export function ThreadFiltersPanel({ thread }: ThreadFiltersPanelProps) {
             </div>
           )}
 
+          {thread?.customer_info && Object.values(thread.customer_info).some(Boolean) ? (
+            <div className="rounded-[16px] border border-border/70 bg-background p-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground mb-2.5">
+                User Details
+              </p>
+              <div className="space-y-1.5 text-sm">
+                {thread.customer_info.name && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-muted-foreground w-12">Name:</span>
+                    <span className="font-medium truncate">{thread.customer_info.name}</span>
+                  </div>
+                )}
+                {thread.customer_info.email && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-muted-foreground w-12">Email:</span>
+                    <span className="font-medium truncate">{thread.customer_info.email}</span>
+                  </div>
+                )}
+                {thread.customer_info.contact_number && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-muted-foreground w-12">Phone:</span>
+                    <span className="font-medium truncate">{thread.customer_info.contact_number}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : null}
+
           {hasFilters ? (
             <div className="space-y-2">
               {filterEntries.map(({ key, label, values }) => (

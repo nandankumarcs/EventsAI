@@ -58,6 +58,19 @@ export type PendingBooking = {
   event_snapshot?: Partial<ResultContextItem>
 }
 
+export type GoalState = {
+  goal_type: 'none' | 'search' | 'booking'
+  goal_stage:
+    | 'no_goal'
+    | 'browsing_results'
+    | 'awaiting_clarification'
+    | 'pending_confirmation'
+    | 'awaiting_user_info'
+    | 'booking_confirmed'
+  goal_summary: string
+  last_open_question: string
+}
+
 export type SearchDomainResult = {
   count: number
   limit: number
@@ -91,6 +104,7 @@ export type ThreadMessage = {
     requested_field?: string
     selected_event?: Partial<ResultContextItem>
     booking?: BookingSummary
+    goal_state?: GoalState
   }
   created_at: string
 }
@@ -111,6 +125,12 @@ export type ThreadSummary = {
     results?: ResultContextItem[]
   }
   pending_booking: PendingBooking | Record<string, never>
+  goal_state?: GoalState
+  customer_info?: {
+    name?: string
+    email?: string
+    contact_number?: string
+  }
 }
 
 export type ThreadDetail = ThreadSummary & {
@@ -150,6 +170,7 @@ export type ChatTurnResponse = {
   pending_booking: ThreadSummary['pending_booking']
   needs_clarification: boolean
   clarification_question: string | null
+  goal_state?: GoalState
 }
 
 export type BookingSummary = {
@@ -168,6 +189,11 @@ export type BookingSummary = {
   confirmed_at: string
   filter_snapshot: ActiveFilters
   event_snapshot: Record<string, unknown>
+}
+
+export type BookingListResponse = {
+  count: number
+  bookings: BookingSummary[]
 }
 
 const API_BASE_URL =
@@ -249,6 +275,16 @@ export async function confirmBooking(threadId: string, listingCode: string) {
 
 export async function deleteThread(threadId: string) {
   return request<{ success: boolean }>(`/api/chats/threads/${threadId}/`, {
+    method: 'DELETE',
+  })
+}
+
+export async function listBookings() {
+  return request<BookingListResponse>('/api/bookings/')
+}
+
+export async function deleteBooking(bookingId: string) {
+  return request<{ success: boolean }>(`/api/bookings/${bookingId}/`, {
     method: 'DELETE',
   })
 }

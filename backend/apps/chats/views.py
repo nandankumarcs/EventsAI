@@ -2,7 +2,6 @@ import json
 from json import JSONDecodeError
 
 from django.http import HttpRequest, HttpResponseNotAllowed, JsonResponse
-from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.chats.models import ChatThread, ThreadFilter
@@ -54,12 +53,15 @@ def thread_detail_view(request: HttpRequest, thread_id) -> JsonResponse:
     if request.method not in ("GET", "DELETE"):
         return HttpResponseNotAllowed(["GET", "DELETE"])
 
-    thread = get_object_or_404(
+    thread = (
         ChatThread.objects.exclude(status=ChatThread.Status.DELETED)
         .select_related("filter_state")
-        .prefetch_related("messages"),
-        id=thread_id,
+        .prefetch_related("messages")
+        .filter(id=thread_id)
+        .first()
     )
+    if thread is None:
+        return JsonResponse({"error": "Thread not found"}, status=404)
 
     if request.method == "DELETE":
         thread.status = ChatThread.Status.DELETED
@@ -71,6 +73,17 @@ def thread_detail_view(request: HttpRequest, thread_id) -> JsonResponse:
 
 def _serialize_thread_summary(thread: ChatThread) -> dict[str, object]:
     filter_state = getattr(thread, "filter_state", None)
+    pending_booking = getattr(filter_state, "pending_booking", {})
+    customer_info = pending_booking.get("customer_info", {})
+    if not customer_info:
+        booking = thread.bookings.order_by("-confirmed_at").first()
+        if booking:
+            customer_info = {
+                "name": booking.customer_name,
+                "email": booking.customer_email,
+                "contact_number": booking.customer_contact_number,
+            }
+
     return {
         "id": str(thread.id),
         "title": thread.title,
@@ -81,7 +94,9 @@ def _serialize_thread_summary(thread: ChatThread) -> dict[str, object]:
         "message_count": thread.messages.count(),
         "active_filters": getattr(filter_state, "active_filters", {}),
         "latest_result_context": getattr(filter_state, "latest_result_context", {}),
-        "pending_booking": getattr(filter_state, "pending_booking", {}),
+        "pending_booking": pending_booking,
+        "goal_state": (thread.metadata or {}).get("goal_state", {}),
+        "customer_info": customer_info,
     }
 
 

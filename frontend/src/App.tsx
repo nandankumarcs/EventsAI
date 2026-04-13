@@ -23,6 +23,30 @@ function App() {
   const [draft, setDraft] = useState('')
   const [threads, setThreads] = useState<ThreadSummary[]>([])
   const [selectedThread, setSelectedThread] = useState<ThreadDetail | null>(null)
+  
+  // Sidebar resizing state
+  const [sidebarWidth, setSidebarWidth] = useState(280)
+  const isDraggingSidebar = useRef(false)
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isDraggingSidebar.current) return
+      let newWidth = e.clientX
+      if (newWidth < 220) newWidth = 220
+      if (newWidth > 600) newWidth = 600
+      setSidebarWidth(newWidth)
+    }
+    const handleMouseUp = () => {
+      isDraggingSidebar.current = false
+      document.body.style.cursor = 'default'
+    }
+    document.addEventListener('mousemove', handleMouseMove)
+    document.addEventListener('mouseup', handleMouseUp)
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove)
+      document.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [])
   const [, setHealth] = useState<HealthResponse | null>(null)
   const [healthError, setHealthError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
@@ -38,7 +62,17 @@ function App() {
   // Whether we're in "pending new chat" mode — no thread yet, waiting for first message
   const isNewChat = !urlThreadId
 
+  // Update page title dynamically
+  useEffect(() => {
+    if (isNewChat || !selectedThread?.title) {
+      document.title = 'Events AI'
+    } else {
+      document.title = `${selectedThread.title} - Events AI`
+    }
+  }, [isNewChat, selectedThread?.title])
+
   // ─── Bootstrap on mount ────────────────────────────────────────────────────
+
 
   useEffect(() => {
     let cancelled = false
@@ -330,19 +364,35 @@ function App() {
 
   return (
     <div className="flex h-screen w-full flex-col overflow-hidden bg-background">
-      <div className="grid h-full min-h-0 flex-1 lg:grid-cols-[280px_minmax(0,1fr)] xl:grid-cols-[280px_minmax(0,1fr)_320px]">
-        <ThreadSidebar
-          threads={threads}
-          selectedThreadId={isNewChat ? null : (urlThreadId ?? null)}
-          isLoading={threadsLoading}
-          isCreating={false}
-          hasMore={hasMoreThreads}
-          isLoadingMore={isLoadingMoreThreads}
-          onLoadMore={loadMoreThreads}
-          onCreateThread={handleCreateThread}
-          onSelectThread={handleSelectThread}
-          onDeleteThread={handleDeleteThread}
-        />
+      <div 
+        className="grid h-full min-h-0 flex-1 lg:grid-cols-[var(--sidebar-width)_minmax(0,1fr)] xl:grid-cols-[var(--sidebar-width)_minmax(0,1fr)_320px]"
+        style={{ '--sidebar-width': `${sidebarWidth}px`, transition: isDraggingSidebar.current ? 'none' : 'grid-template-columns 0.1s ease-out' } as React.CSSProperties}
+      >
+        <div className="relative flex h-full min-h-0">
+          <ThreadSidebar
+            threads={threads}
+            selectedThreadId={isNewChat ? null : (urlThreadId ?? null)}
+            isLoading={threadsLoading}
+            isCreating={false}
+            hasMore={hasMoreThreads}
+            isLoadingMore={isLoadingMoreThreads}
+            onLoadMore={loadMoreThreads}
+            onCreateThread={handleCreateThread}
+            onSelectThread={handleSelectThread}
+            onDeleteThread={handleDeleteThread}
+          />
+          {/* Resize Handle */}
+          <div
+            className="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/40 z-50 group flex items-center justify-center transition-colors"
+            style={{ transform: 'translateX(50%)' }}
+            onMouseDown={() => {
+              isDraggingSidebar.current = true
+              document.body.style.cursor = 'col-resize'
+            }}
+          >
+            <div className="h-8 w-1 rounded-full bg-border group-hover:bg-primary/50 transition-colors" />
+          </div>
+        </div>
         <ChatWorkspace
           thread={selectedThread}
           draft={draft}

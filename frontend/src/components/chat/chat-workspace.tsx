@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import {
   ArrowDown,
@@ -21,7 +21,7 @@ import type {
   ThreadDetail,
   ThreadMessage,
 } from '@/lib/api'
-import { getRandomPrompts } from '@/lib/prompts'
+
 import { Skeleton } from '@/components/ui/skeleton'
 
 type ChatWorkspaceProps = {
@@ -61,9 +61,6 @@ export function ChatWorkspace({
   const historyRef = useRef<HTMLDivElement | null>(null)
   const [isAtBottom, setIsAtBottom] = useState(true)
 
-  // Randomly fetch 4 prompts on mount
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const suggestedPrompts = useMemo(() => getRandomPrompts(4), [thread?.id])
 
   // Track whether the user has scrolled away from the bottom
   function handleScroll() {
@@ -184,6 +181,12 @@ export function ChatWorkspace({
                   <Skeleton className="h-4 w-[65%] rounded-full" />
                   <Skeleton className="h-4 w-[45%] rounded-full" />
                   <Skeleton className="h-4 w-[70%] rounded-full" />
+                  {/* Skeleton cards */}
+                  <div className="flex gap-3 overflow-hidden px-1 pb-2 pt-3">
+                    <ResultCardSkeleton />
+                    <ResultCardSkeleton />
+                    <ResultCardSkeleton />
+                  </div>
                 </div>
               </div>
 
@@ -207,7 +210,7 @@ export function ChatWorkspace({
                 </p>
               </div>
 
-              <div className="grid w-full grid-cols-1 sm:grid-cols-2 gap-3 text-left">
+              {/* <div className="grid w-full grid-cols-1 sm:grid-cols-2 gap-3 text-left">
                 {suggestedPrompts.map((prompt: { icon: any; text: string }, idx: number) => {
                   const Icon = prompt.icon
                   return (
@@ -224,7 +227,7 @@ export function ChatWorkspace({
                     </button>
                   )
                 })}
-              </div>
+              </div> */}
             </div>
           ) : null}
 
@@ -254,12 +257,6 @@ export function ChatWorkspace({
                       <div className="w-2 h-2 bg-primary/40 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
                       <div className="w-2 h-2 bg-primary/40 rounded-full animate-bounce"></div>
                     </div>
-                  </div>
-                  {/* Skeleton cards while waiting for results */}
-                  <div className="flex gap-3 overflow-hidden px-1 pb-2 pt-1">
-                    <ResultCardSkeleton />
-                    <ResultCardSkeleton />
-                    <ResultCardSkeleton />
                   </div>
                 </div>
               </div>
@@ -366,6 +363,7 @@ function MessageBlock({ message, threadStatus }: MessageBlockProps) {
   const resultsByDomain = message.metadata.results_by_domain ?? {}
   const allResults = Object.values(resultsByDomain).flatMap((domain) => domain.results)
   const selectedBookingResult = getSelectedBookingResult(message)
+  const shouldHideResultsCarousel = Boolean(selectedBookingResult)
   const formattedTime = message.created_at
     ? new Date(message.created_at).toLocaleString(undefined, {
         month: 'short',
@@ -406,7 +404,7 @@ function MessageBlock({ message, threadStatus }: MessageBlockProps) {
           </div>
         )}
 
-        {isAssistant && allResults.length > 0 ? (
+        {isAssistant && allResults.length > 0 && !shouldHideResultsCarousel ? (
           <ResultCarousel results={allResults} threadStatus={threadStatus} />
         ) : null}
 
@@ -456,12 +454,14 @@ function ResultCarousel({
   return (
     <div className="group relative max-w-full">
       {canScrollLeft && (
-        <button
-          onClick={scrollLeft}
-          className="absolute -left-3 top-1/2 z-10 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-full border border-border/80 bg-background text-foreground shadow-md transition-all hover:scale-110 hover:shadow-lg active:scale-95 focus:outline-none"
-        >
-          <ChevronLeft className="h-[18px] w-[18px]" />
-        </button>
+        <>
+          <button
+            onClick={scrollLeft}
+            className="absolute -left-3 top-1/2 z-10 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-full border border-border/80 bg-background text-foreground shadow-md transition-all hover:scale-110 hover:shadow-lg active:scale-95 focus:outline-none"
+          >
+            <ChevronLeft className="h-[18px] w-[18px]" />
+          </button>
+        </>
       )}
 
       <div
@@ -479,12 +479,15 @@ function ResultCarousel({
       </div>
 
       {canScrollRight && (
-        <button
-          onClick={scrollRight}
-          className="absolute -right-3 top-1/2 z-10 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-full border border-border/80 bg-background text-foreground shadow-md transition-all hover:scale-110 hover:shadow-lg active:scale-95 focus:outline-none"
-        >
-          <ChevronRight className="h-[18px] w-[18px]" />
-        </button>
+        <>
+          <div className="pointer-events-none absolute bottom-2 right-0 top-0 z-[5] w-12 bg-gradient-to-l from-background to-transparent" />
+          <button
+            onClick={scrollRight}
+            className="absolute -right-3 top-1/2 z-10 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-full border border-border/80 bg-background text-foreground shadow-md transition-all hover:scale-110 hover:shadow-lg active:scale-95 focus:outline-none"
+          >
+            <ChevronRight className="h-[18px] w-[18px]" />
+          </button>
+        </>
       )}
     </div>
   )
@@ -539,7 +542,7 @@ function ResultCard({ result, booked }: ResultCardProps) {
 
 function ResultCardSkeleton() {
   return (
-    <div className="snap-start w-[272px] min-w-[272px] rounded-[24px] border border-border/70 bg-white/86 p-3.5 shadow-sm sm:w-[286px] sm:min-w-[286px]">
+    <div className="snap-start w-[272px] min-w-[272px] rounded-[24px] border border-border/20 bg-muted/10 p-3.5 sm:w-[286px] sm:min-w-[286px]">
       <div className="space-y-2.5">
         {/* Title block */}
         <div className="space-y-1.5">

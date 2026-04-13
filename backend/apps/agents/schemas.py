@@ -64,6 +64,40 @@ class SearchSummary(BaseModel):
     result_titles: list[str] = Field(default_factory=list)
 
 
+class BookingSelectedEvent(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    listing_code: str = ""
+    title: str = ""
+    city: str = ""
+    venue_name: str = ""
+    event_date: str = ""
+    start_at: str = ""
+    domain: str = ""
+    position: int | None = None
+    min_price: int | None = None
+    max_price: int | None = None
+    sport_type: str | None = None
+
+
+class BookingSummaryPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = ""
+    thread_id: str | None = None
+    booking_reference: str = ""
+    event_type: str = ""
+    status: str = ""
+    event_title: str = ""
+    customer_name: str = ""
+    customer_email: str = ""
+    customer_contact_number: str = ""
+    city: str = ""
+    venue_name: str = ""
+    starts_at: str = ""
+    confirmed_at: str = ""
+
+
 class BookingTurnResolution(BaseModel):
     action: Literal[
         "none",
@@ -77,9 +111,37 @@ class BookingTurnResolution(BaseModel):
     message: str = ""
     listing_code: str = ""
     requested_field: str = ""
-    selected_event: dict[str, Any] = Field(default_factory=dict)
-    booking: dict[str, Any] = Field(default_factory=dict)
+    selected_event: BookingSelectedEvent = Field(default_factory=BookingSelectedEvent)
+    booking: BookingSummaryPayload = Field(default_factory=BookingSummaryPayload)
     candidates: list[str] = Field(default_factory=list)
+
+
+class GoalState(BaseModel):
+    goal_type: Literal["none", "search", "booking"] = "none"
+    goal_stage: Literal[
+        "no_goal",
+        "browsing_results",
+        "awaiting_clarification",
+        "pending_confirmation",
+        "awaiting_user_info",
+        "booking_confirmed",
+    ] = "no_goal"
+    goal_summary: str = ""
+    last_open_question: str = ""
+
+
+class TurnPolicy(BaseModel):
+    intent: Literal[
+        "task_continue",
+        "search_change",
+        "booking_change",
+        "follow_up_about_results",
+        "temporary_distraction",
+        "out_of_scope",
+        "meta_help",
+    ] = "task_continue"
+    message: str = ""
+    should_keep_results: bool = False
 
 
 class TurnUpdate(BaseModel):

@@ -49,3 +49,17 @@ def booking_confirm_view(request: HttpRequest) -> JsonResponse:
         {"booking": serialize_booking(booking), "already_confirmed": already_confirmed},
         status=200 if already_confirmed else 201,
     )
+
+
+@csrf_exempt
+def booking_delete_view(request: HttpRequest, booking_id: str) -> JsonResponse:
+    if request.method != "DELETE":
+        return HttpResponseNotAllowed(["DELETE"])
+
+    try:
+        booking = Booking.objects.get(id=booking_id)
+        # Assuming soft-delete or hard-delete? Django ORM handles hard-delete simply:
+        booking.delete()
+        return JsonResponse({"success": True}, status=200)
+    except Booking.DoesNotExist:
+        return JsonResponse({"error": "Booking not found"}, status=404)

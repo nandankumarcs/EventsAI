@@ -34,6 +34,7 @@ DB_CONN_MAX_AGE = int(os.getenv("DB_CONN_MAX_AGE", "0" if get_bool("DJANGO_DEBUG
 USE_OLLAMA = get_bool("USE_OLLAMA", False)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e2b")
+ENABLE_DYNAMIC_THREAD_TITLE_GENERATION = get_bool("ENABLE_DYNAMIC_THREAD_TITLE_GENERATION", False)
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-attend-secret-key")
 DEBUG = get_bool("DJANGO_DEBUG", True)
