@@ -111,6 +111,7 @@ class BookingTurnResolution(BaseModel):
     message: str = ""
     listing_code: str = ""
     requested_field: str = ""
+    captured_value: str = ""
     selected_event: BookingSelectedEvent = Field(default_factory=BookingSelectedEvent)
     booking: BookingSummaryPayload = Field(default_factory=BookingSummaryPayload)
     candidates: list[str] = Field(default_factory=list)
@@ -142,6 +143,28 @@ class TurnPolicy(BaseModel):
     ] = "task_continue"
     message: str = ""
     should_keep_results: bool = False
+
+
+class ResolverInvocationPlan(BaseModel):
+    intent: Literal[
+        "task_continue",
+        "search_change",
+        "booking_change",
+        "follow_up_about_results",
+        "temporary_distraction",
+        "out_of_scope",
+        "meta_help",
+    ] = "task_continue"
+    message: str = ""
+    should_keep_results: bool = False
+    should_try_booking_agent: bool = False
+    run_event_type: bool = True
+    run_location: bool = True
+    run_temporal: bool = True
+    run_movie_filters: bool = True
+    run_sport_filters: bool = True
+    run_sport_catalog_inquiry: bool = True
+    rationale: str = ""
 
 
 class TurnUpdate(BaseModel):

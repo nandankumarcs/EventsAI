@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from types import SimpleNamespace
 
 from django.db import transaction
 from django.db.models import Max
@@ -74,28 +75,66 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
         current_filters = ActiveFilters.model_validate(thread_filter.active_filters or {})
         pending_booking_before_turn = dict(thread_filter.pending_booking or {})
         existing_goal_state = _get_thread_goal_state(thread)
+        has_pending_booking = bool((thread_filter.pending_booking or {}).get("listing_code"))
 
         _append_message(thread, role=ChatMessage.Role.USER, content=user_message, metadata={})
 
-        turn_policy = invoke_turn_policy(
-            user_message=user_message,
-            current_filters=current_filters,
-            pending_booking=thread_filter.pending_booking,
-            latest_result_context=thread_filter.latest_result_context,
-            goal_state=existing_goal_state,
-        )
-        if turn_policy.intent in {"temporary_distraction", "out_of_scope", "meta_help"}:
-            return _process_soft_redirect_turn(
-                thread=thread,
-                thread_filter=thread_filter,
-                current_filters=current_filters,
-                turn_policy=turn_policy,
+        resolver_plan = None
+        if has_pending_booking:
+            turn_policy = invoke_turn_policy(
                 user_message=user_message,
-                existing_goal_state=existing_goal_state,
+                current_filters=current_filters,
+                pending_booking=thread_filter.pending_booking,
+                latest_result_context=thread_filter.latest_result_context,
+                goal_state=existing_goal_state,
             )
+            if turn_policy.intent in {"temporary_distraction", "out_of_scope", "meta_help"}:
+                return _process_soft_redirect_turn(
+                    thread=thread,
+                    thread_filter=thread_filter,
+                    current_filters=current_filters,
+                    turn_policy=turn_policy,
+                    user_message=user_message,
+                    existing_goal_state=existing_goal_state,
+                )
+        else:
+            from apps.agents.langchain_tools import invoke_resolver_invocation_plan
+
+            resolver_plan = invoke_resolver_invocation_plan(
+                user_message=user_message,
+                current_filters=current_filters,
+                pending_booking=thread_filter.pending_booking,
+                latest_result_context=thread_filter.latest_result_context,
+                turn_policy_intent="task_continue",
+            )
+            turn_policy = SimpleNamespace(
+                intent=resolver_plan.intent,
+                message=resolver_plan.message,
+                should_keep_results=resolver_plan.should_keep_results,
+            )
+            if turn_policy.intent in {"temporary_distraction", "out_of_scope", "meta_help"}:
+                return _process_soft_redirect_turn(
+                    thread=thread,
+                    thread_filter=thread_filter,
+                    current_filters=current_filters,
+                    turn_policy=turn_policy,
+                    user_message=user_message,
+                    existing_goal_state=existing_goal_state,
+                )
 
         booking_resolution = BookingTurnResolution(action="none")
-        if turn_policy.intent in {"task_continue", "booking_change", "follow_up_about_results"}:
+        if has_pending_booking and turn_policy.intent in {"task_continue", "booking_change", "follow_up_about_results"}:
+            booking_resolution = invoke_booking_agent(thread_id=str(thread.id), user_message=user_message)
+            thread_filter.refresh_from_db()
+            booking_resolution = _reconcile_booking_resolution(
+                user_message=user_message,
+                booking_resolution=booking_resolution,
+                thread_filter=thread_filter,
+                pending_booking_before_turn=pending_booking_before_turn,
+                current_filters=current_filters,
+                reference_date=reference_date,
+            )
+        elif not has_pending_booking and resolver_plan and resolver_plan.should_try_booking_agent:
             booking_resolution = invoke_booking_agent(thread_id=str(thread.id), user_message=user_message)
             thread_filter.refresh_from_db()
             booking_resolution = _reconcile_booking_resolution(
@@ -177,6 +216,10 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
             current_filters=current_filters,
             user_message=user_message,
             reference_date=reference_date,
+            pending_booking=thread_filter.pending_booking,
+            latest_result_context=thread_filter.latest_result_context,
+            turn_policy_intent=turn_policy.intent,
+            resolver_plan=resolver_plan,
         )
     filters_to_clear = _derive_filters_to_clear(
         current_filters=current_filters,

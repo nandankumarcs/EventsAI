@@ -20,6 +20,13 @@ def get_bool(name: str, default: bool) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def get_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return float(value)
+
+
 def get_list(name: str, default: str) -> list[str]:
     raw_value = os.getenv(name, default)
     return [item.strip() for item in raw_value.split(",") if item.strip()]
@@ -29,6 +36,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
 OPENAI_RESOLVER_MODEL = os.getenv("OPENAI_RESOLVER_MODEL", "gpt-4.1-mini")
 DB_CONN_MAX_AGE = int(os.getenv("DB_CONN_MAX_AGE", "0" if get_bool("DJANGO_DEBUG", True) else "600"))
+OPENAI_LLM_TIMEOUT_SECONDS = get_float("OPENAI_LLM_TIMEOUT_SECONDS", 20.0)
+OLLAMA_LLM_TIMEOUT_SECONDS = get_float("OLLAMA_LLM_TIMEOUT_SECONDS", OPENAI_LLM_TIMEOUT_SECONDS)
+AGENT_SLOW_LOG_SECONDS = get_float("AGENT_SLOW_LOG_SECONDS", 2.5)
 
 # Ollama configuration (for local Gemma 4)
 USE_OLLAMA = get_bool("USE_OLLAMA", False)

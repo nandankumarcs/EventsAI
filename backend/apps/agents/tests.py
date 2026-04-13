@@ -1,18 +1,21 @@
 from unittest.mock import patch
 from datetime import datetime
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from apps.agents.langchain_tools import (
     ResolutionIssue,
     TurnResolution,
+    _timed_invoke,
+    get_chat_model,
     invoke_booking_agent,
     invoke_goal_state,
     invoke_temporal_resolver,
     resolve_turn_filters,
 )
 from apps.agents.schemas import ActiveFilters, BookingTurnResolution, CatalogInquiry, FilterResolution, GoalState, TurnPolicy
+from apps.agents.schemas import ResolverInvocationPlan
 from apps.agents.services import ChatTurnError, _derive_filters_to_clear, _update_dynamic_thread_title, process_chat_turn
 from apps.bookings.models import Booking
 from apps.bookings.services import (
@@ -29,6 +32,12 @@ from apps.events.services import SearchResult
 class AgentServiceTests(TestCase):
     def setUp(self):
         super().setUp()
+        self.execution_plan_patcher = patch(
+            "apps.agents.langchain_tools.invoke_resolver_invocation_plan",
+            return_value=ResolverInvocationPlan(),
+        )
+        self.execution_plan_mock = self.execution_plan_patcher.start()
+        self.addCleanup(self.execution_plan_patcher.stop)
         self.turn_policy_patcher = patch(
             "apps.agents.services.invoke_turn_policy",
             return_value=TurnPolicy(intent="task_continue"),
@@ -142,6 +151,10 @@ class AgentServiceTests(TestCase):
         invoke_booking_agent_mock,
         resolve_turn_filters_mock,
     ):
+        self.execution_plan_mock.return_value = ResolverInvocationPlan(
+            intent="task_continue",
+            should_try_booking_agent=True,
+        )
         thread = ChatThread.objects.create(title="Existing thread")
         ThreadFilter.objects.create(thread=thread, active_filters={"event_types": ["sports"]})
         invoke_booking_agent_mock.return_value = BookingTurnResolution(
@@ -199,6 +212,10 @@ class AgentServiceTests(TestCase):
         invoke_booking_agent_mock,
         resolve_turn_filters_mock,
     ):
+        self.execution_plan_mock.return_value = ResolverInvocationPlan(
+            intent="task_continue",
+            should_try_booking_agent=True,
+        )
         thread = ChatThread.objects.create(title="Existing thread")
         thread_filter = ThreadFilter.objects.create(
             thread=thread,
@@ -462,6 +479,7 @@ class AgentServiceTests(TestCase):
         build_booking_user_info_chain_mock.return_value.invoke.return_value = BookingTurnResolution(
             action="booking_confirmed",
             message="I have recorded the name as Nandan Kumar.",
+            captured_value="Nandan Kumar",
         )
         capture_user_info_mock.return_value = {
             "status": "saved",
@@ -496,6 +514,94 @@ class AgentServiceTests(TestCase):
             value="Nandan Kumar",
         )
         attempt_confirmation_mock.assert_called_once()
+
+    @patch("apps.agents.langchain_tools.capture_thread_booking_user_info")
+    @patch("apps.agents.langchain_tools._build_booking_user_info_chain")
+    def test_invoke_booking_agent_user_info_uses_structured_captured_value_for_name(
+        self,
+        build_booking_user_info_chain_mock,
+        capture_user_info_mock,
+    ):
+        thread = ChatThread.objects.create(title="Booking thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "name",
+                "customer_info": {"name": "", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+            latest_result_context={"results": []},
+        )
+        build_booking_user_info_chain_mock.return_value.invoke.return_value = BookingTurnResolution(
+            action="booking_confirmed",
+            message="Recorded your name.",
+            captured_value="Nandan Kumar",
+        )
+        capture_user_info_mock.return_value = {
+            "status": "saved",
+            "pending_booking": {
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": None,
+                "customer_info": {"name": "Nandan Kumar", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+        }
+
+        invoke_booking_agent(thread_id=str(thread.id), user_message="my name is Nandan Kumar")
+
+        capture_user_info_mock.assert_called_once_with(
+            thread_filter=thread.filter_state,
+            field_name="name",
+            value="Nandan Kumar",
+        )
+
+    @patch("apps.agents.langchain_tools.capture_thread_booking_user_info")
+    @patch("apps.agents.langchain_tools._build_booking_user_info_chain")
+    def test_invoke_booking_agent_user_info_falls_back_to_raw_message_when_captured_value_missing(
+        self,
+        build_booking_user_info_chain_mock,
+        capture_user_info_mock,
+    ):
+        thread = ChatThread.objects.create(title="Booking thread")
+        ThreadFilter.objects.create(
+            thread=thread,
+            pending_booking={
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "email",
+                "customer_info": {"name": "Nandan Kumar", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+            latest_result_context={"results": []},
+        )
+        build_booking_user_info_chain_mock.return_value.invoke.return_value = BookingTurnResolution(
+            action="booking_confirmed",
+            message="Recorded your email.",
+            captured_value="",
+        )
+        capture_user_info_mock.return_value = {
+            "status": "invalid_user_info",
+            "message": "Please provide a valid email address.",
+            "pending_booking": {
+                "status": "awaiting_user_info",
+                "listing_code": "SPT-1",
+                "awaiting_field": "email",
+                "customer_info": {"name": "Nandan Kumar", "email": "", "contact_number": ""},
+                "event_snapshot": {"listing_code": "SPT-1", "title": "Mumbai Match", "domain": "sports"},
+            },
+            "field_name": "email",
+        }
+
+        invoke_booking_agent(thread_id=str(thread.id), user_message="email is nandan@example.com")
+
+        capture_user_info_mock.assert_called_once_with(
+            thread_filter=thread.filter_state,
+            field_name="email",
+            value="email is nandan@example.com",
+        )
 
     @patch("apps.agents.langchain_tools.capture_thread_booking_user_info")
     @patch("apps.agents.langchain_tools._build_booking_user_info_chain")
@@ -817,6 +923,10 @@ class AgentServiceTests(TestCase):
         invoke_booking_agent_mock,
         resolve_turn_filters_mock,
     ):
+        self.execution_plan_mock.return_value = ResolverInvocationPlan(
+            intent="task_continue",
+            should_try_booking_agent=True,
+        )
         thread = ChatThread.objects.create(title="Existing thread")
         ThreadFilter.objects.create(
             thread=thread,
@@ -866,6 +976,10 @@ class AgentServiceTests(TestCase):
         invoke_booking_agent_mock,
         resolve_turn_filters_mock,
     ):
+        self.execution_plan_mock.return_value = ResolverInvocationPlan(
+            intent="task_continue",
+            should_try_booking_agent=True,
+        )
         thread = ChatThread.objects.create(title="Existing thread")
         thread_filter = ThreadFilter.objects.create(
             thread=thread,
@@ -1123,14 +1237,14 @@ class AgentServiceTests(TestCase):
         self.assertEqual(thread_filter.pending_booking["awaiting_field"], "contact_number")
 
     @patch("apps.agents.services.invoke_booking_agent", return_value=BookingTurnResolution(action="none"))
-    @patch("apps.agents.services.invoke_turn_policy")
+    @patch("apps.agents.langchain_tools.invoke_resolver_invocation_plan")
     @patch("apps.agents.services.search_sport_events")
     @patch("apps.agents.services.resolve_turn_filters")
     def test_process_chat_turn_soft_redirects_off_track_and_keeps_current_results(
         self,
         resolve_turn_filters_mock,
         search_sport_events_mock,
-        invoke_turn_policy_mock,
+        invoke_resolver_plan_mock,
         _invoke_booking_agent_mock,
     ):
         thread = ChatThread.objects.create(title="Existing thread")
@@ -1142,10 +1256,11 @@ class AgentServiceTests(TestCase):
                 "sport_types": ["Football"],
             },
         )
-        invoke_turn_policy_mock.return_value = TurnPolicy(
+        invoke_resolver_plan_mock.return_value = ResolverInvocationPlan(
             intent="temporary_distraction",
             message="I can help with event plans here. Coming back to your football search, these are the current matches.",
             should_keep_results=True,
+            should_try_booking_agent=False,
         )
         search_sport_events_mock.return_value = SearchResult(
             count=1,
@@ -1272,18 +1387,19 @@ class AgentServiceTests(TestCase):
         self.assertEqual(payload["assistant_message"]["metadata"]["results_by_domain"], {})
 
     @patch("apps.agents.services.invoke_booking_agent", return_value=BookingTurnResolution(action="none"))
-    @patch("apps.agents.services.invoke_turn_policy")
+    @patch("apps.agents.langchain_tools.invoke_resolver_invocation_plan")
     @patch("apps.agents.services.resolve_turn_filters")
     def test_process_chat_turn_does_not_soft_redirect_search_change_intent(
         self,
         resolve_turn_filters_mock,
-        invoke_turn_policy_mock,
+        invoke_resolver_plan_mock,
         _invoke_booking_agent_mock,
     ):
-        invoke_turn_policy_mock.return_value = TurnPolicy(
+        invoke_resolver_plan_mock.return_value = ResolverInvocationPlan(
             intent="search_change",
             message="Looking for upcoming football matches. I'll find those for you.",
             should_keep_results=False,
+            should_try_booking_agent=False,
         )
         resolve_turn_filters_mock.return_value = TurnResolution(
             updates=ActiveFilters(event_types=["sports"], sport_types=["Football"]),
@@ -1297,12 +1413,12 @@ class AgentServiceTests(TestCase):
         self.assertEqual(payload["active_filters"]["sport_types"], ["Football"])
 
     @patch("apps.agents.services.invoke_booking_agent")
-    @patch("apps.agents.services.invoke_turn_policy")
+    @patch("apps.agents.langchain_tools.invoke_resolver_invocation_plan")
     @patch("apps.agents.services.resolve_turn_filters")
     def test_process_chat_turn_skips_booking_resolution_for_search_change_city_correction(
         self,
         resolve_turn_filters_mock,
-        invoke_turn_policy_mock,
+        invoke_resolver_plan_mock,
         invoke_booking_agent_mock,
     ):
         thread = ChatThread.objects.create(title="Existing thread")
@@ -1331,10 +1447,11 @@ class AgentServiceTests(TestCase):
                 ],
             },
         )
-        invoke_turn_policy_mock.return_value = TurnPolicy(
+        invoke_resolver_plan_mock.return_value = ResolverInvocationPlan(
             intent="search_change",
             message="",
             should_keep_results=False,
+            should_try_booking_agent=False,
         )
         resolve_turn_filters_mock.return_value = TurnResolution(
             updates=ActiveFilters(cities=["Pune"]),
@@ -1349,12 +1466,12 @@ class AgentServiceTests(TestCase):
         self.assertEqual(payload["active_filters"]["sport_types"], ["Cricket"])
 
     @patch("apps.agents.services.invoke_booking_agent")
-    @patch("apps.agents.services.invoke_turn_policy")
+    @patch("apps.agents.langchain_tools.invoke_resolver_invocation_plan")
     @patch("apps.agents.services.resolve_turn_filters")
     def test_process_chat_turn_skips_booking_resolution_for_search_change_domain_switch(
         self,
         resolve_turn_filters_mock,
-        invoke_turn_policy_mock,
+        invoke_resolver_plan_mock,
         invoke_booking_agent_mock,
     ):
         thread = ChatThread.objects.create(title="Existing thread")
@@ -1382,10 +1499,11 @@ class AgentServiceTests(TestCase):
                 ],
             },
         )
-        invoke_turn_policy_mock.return_value = TurnPolicy(
+        invoke_resolver_plan_mock.return_value = ResolverInvocationPlan(
             intent="search_change",
             message="",
             should_keep_results=False,
+            should_try_booking_agent=False,
         )
         resolve_turn_filters_mock.return_value = TurnResolution(
             updates=ActiveFilters(event_types=["sports"], sport_types=["Cricket"]),
@@ -1726,6 +1844,29 @@ class AgentServiceTests(TestCase):
 
 
 class AgentLogicTests(TestCase):
+    def setUp(self):
+        super().setUp()
+        self.resolver_plan_patcher = patch(
+            "apps.agents.langchain_tools.invoke_resolver_invocation_plan",
+            return_value=ResolverInvocationPlan(),
+        )
+        self.resolver_plan_mock = self.resolver_plan_patcher.start()
+        self.addCleanup(self.resolver_plan_patcher.stop)
+
+    @override_settings(USE_OLLAMA=False, OPENAI_LLM_TIMEOUT_SECONDS=12.5)
+    def test_get_chat_model_applies_configured_openai_timeout(self):
+        llm = get_chat_model(resolver=True)
+
+        self.assertEqual(llm.request_timeout, 12.5)
+
+    @patch("apps.agents.langchain_tools.logger")
+    @patch("apps.agents.langchain_tools._slow_log_threshold_seconds", return_value=0.0)
+    def test_timed_invoke_logs_warning_for_slow_calls(self, _threshold_mock, logger_mock):
+        result = _timed_invoke("resolve_turn_policy", lambda: "ok")
+
+        self.assertEqual(result, "ok")
+        logger_mock.warning.assert_called_once()
+
     @patch("apps.agents.langchain_tools._build_goal_state_chain")
     def test_invoke_goal_state_regrounds_incorrect_movie_summary_for_sports_search(self, build_goal_state_chain_mock):
         build_goal_state_chain_mock.return_value.invoke.return_value = GoalState(
@@ -1911,14 +2052,24 @@ class AgentLogicTests(TestCase):
     @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
     @patch("apps.agents.langchain_tools.invoke_location_resolver")
     @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    @patch("apps.agents.langchain_tools.invoke_resolver_invocation_plan")
     def test_resolve_turn_filters_infers_sports_domain_from_specific_filter_when_event_type_is_missing(
         self,
+        resolver_plan_mock,
         event_type_resolver_mock,
         location_resolver_mock,
         temporal_resolver_mock,
         movie_filter_resolver_mock,
         sport_filter_resolver_mock,
     ):
+        resolver_plan_mock.return_value = ResolverInvocationPlan(
+            run_event_type=True,
+            run_location=True,
+            run_temporal=True,
+            run_movie_filters=False,
+            run_sport_filters=True,
+            run_sport_catalog_inquiry=False,
+        )
         event_type_resolver_mock.return_value = FilterResolution(status="no_input")
         movie_filter_resolver_mock.return_value = FilterResolution(status="no_input")
         sport_filter_resolver_mock.return_value = FilterResolution(
@@ -1958,14 +2109,24 @@ class AgentLogicTests(TestCase):
     @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
     @patch("apps.agents.langchain_tools.invoke_location_resolver")
     @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    @patch("apps.agents.langchain_tools.invoke_resolver_invocation_plan")
     def test_resolve_turn_filters_infers_movie_domain_from_specific_filter_when_event_type_is_missing(
         self,
+        resolver_plan_mock,
         event_type_resolver_mock,
         location_resolver_mock,
         temporal_resolver_mock,
         movie_filter_resolver_mock,
         sport_filter_resolver_mock,
     ):
+        resolver_plan_mock.return_value = ResolverInvocationPlan(
+            run_event_type=True,
+            run_location=True,
+            run_temporal=True,
+            run_movie_filters=True,
+            run_sport_filters=False,
+            run_sport_catalog_inquiry=False,
+        )
         event_type_resolver_mock.return_value = FilterResolution(status="no_input")
         movie_filter_resolver_mock.return_value = FilterResolution(
             status="resolved",
@@ -2116,8 +2277,10 @@ class AgentLogicTests(TestCase):
     @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
     @patch("apps.agents.langchain_tools.invoke_location_resolver")
     @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    @patch("apps.agents.langchain_tools.invoke_resolver_invocation_plan")
     def test_resolve_turn_filters_does_not_run_sport_catalog_inquiry_for_temporal_follow_up(
         self,
+        resolver_plan_mock,
         event_type_resolver_mock,
         location_resolver_mock,
         temporal_resolver_mock,
@@ -2125,6 +2288,14 @@ class AgentLogicTests(TestCase):
         sport_catalog_inquiry_mock,
         sport_filter_resolver_mock,
     ):
+        resolver_plan_mock.return_value = ResolverInvocationPlan(
+            run_event_type=False,
+            run_location=False,
+            run_temporal=True,
+            run_movie_filters=False,
+            run_sport_filters=False,
+            run_sport_catalog_inquiry=False,
+        )
         current_filters = ActiveFilters(
             event_types=["sports"],
             event_dates=["2026-04-12"],
@@ -2151,6 +2322,91 @@ class AgentLogicTests(TestCase):
         self.assertEqual(result.updates.date_from, "2026-04-06")
         self.assertEqual(result.updates.date_to, "2026-04-11")
         self.assertEqual(result.updates.sport_types, [])
+
+    @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_movie_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
+    @patch("apps.agents.langchain_tools.invoke_location_resolver")
+    @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    @patch("apps.agents.langchain_tools.invoke_resolver_invocation_plan")
+    def test_resolve_turn_filters_uses_location_only_plan_for_city_correction(
+        self,
+        resolver_plan_mock,
+        event_type_resolver_mock,
+        location_resolver_mock,
+        temporal_resolver_mock,
+        movie_filter_resolver_mock,
+        sport_filter_resolver_mock,
+    ):
+        resolver_plan_mock.return_value = ResolverInvocationPlan(
+            run_event_type=False,
+            run_location=True,
+            run_temporal=False,
+            run_movie_filters=False,
+            run_sport_filters=False,
+            run_sport_catalog_inquiry=False,
+        )
+        location_resolver_mock.return_value = FilterResolution(
+            status="resolved",
+            active_filters_partial=ActiveFilters(cities=["Mumbai"]),
+        )
+
+        result = resolve_turn_filters(
+            user_message="Actually Mumbai again",
+            current_filters=ActiveFilters(event_types=["sports"], cities=["Delhi"], sport_types=["Cricket"]),
+            reference_date="2026-04-13",
+        )
+
+        self.assertEqual(result.updates.cities, ["Mumbai"])
+        event_type_resolver_mock.assert_not_called()
+        temporal_resolver_mock.assert_not_called()
+        movie_filter_resolver_mock.assert_not_called()
+        sport_filter_resolver_mock.assert_not_called()
+        location_resolver_mock.assert_called_once()
+
+    @patch("apps.agents.langchain_tools.invoke_sport_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_movie_filter_resolver")
+    @patch("apps.agents.langchain_tools.invoke_temporal_resolver")
+    @patch("apps.agents.langchain_tools.invoke_location_resolver")
+    @patch("apps.agents.langchain_tools.invoke_event_type_resolver")
+    @patch("apps.agents.langchain_tools.invoke_resolver_invocation_plan")
+    def test_resolve_turn_filters_uses_temporal_only_plan_for_date_correction(
+        self,
+        resolver_plan_mock,
+        event_type_resolver_mock,
+        location_resolver_mock,
+        temporal_resolver_mock,
+        movie_filter_resolver_mock,
+        sport_filter_resolver_mock,
+    ):
+        resolver_plan_mock.return_value = ResolverInvocationPlan(
+            run_event_type=False,
+            run_location=False,
+            run_temporal=True,
+            run_movie_filters=False,
+            run_sport_filters=False,
+            run_sport_catalog_inquiry=False,
+        )
+        temporal_resolver_mock.return_value = FilterResolution(
+            status="resolved",
+            clear_fields=["event_dates"],
+            active_filters_partial=ActiveFilters(date_from="2026-04-20", date_to="2026-04-26"),
+        )
+
+        result = resolve_turn_filters(
+            user_message="next week instead",
+            current_filters=ActiveFilters(event_types=["sports"], event_dates=["2026-04-12"], sport_types=["Cricket"]),
+            reference_date="2026-04-13",
+        )
+
+        self.assertEqual(result.clear_fields, ["event_dates"])
+        self.assertEqual(result.updates.date_from, "2026-04-20")
+        self.assertEqual(result.updates.date_to, "2026-04-26")
+        event_type_resolver_mock.assert_not_called()
+        location_resolver_mock.assert_not_called()
+        movie_filter_resolver_mock.assert_not_called()
+        sport_filter_resolver_mock.assert_not_called()
+        temporal_resolver_mock.assert_called_once()
 
     def test_sanitize_temporal_resolution_clears_conflicting_temporal_mode_fields(self):
         from apps.agents.langchain_tools import _sanitize_temporal_resolution

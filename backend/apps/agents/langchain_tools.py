@@ -5,6 +5,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
+from time import perf_counter
 from typing import Literal
 
 from langgraph.prebuilt import create_react_agent
@@ -14,7 +15,7 @@ from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
 
 from apps.agents.schemas import ActiveFilters, BookingTurnResolution, CatalogInquiry, FilterResolution
-from apps.agents.schemas import GoalState, TurnPolicy
+from apps.agents.schemas import GoalState, ResolverInvocationPlan, TurnPolicy
 from apps.bookings.services import (
     attempt_thread_pending_booking_confirmation,
     BookingFlowError,
@@ -70,6 +71,24 @@ from apps.events.resolver_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _slow_log_threshold_seconds() -> float:
+    from django.conf import settings
+
+    return float(getattr(settings, "AGENT_SLOW_LOG_SECONDS", 2.5))
+
+
+def _timed_invoke(label: str, callback):
+    started_at = perf_counter()
+    try:
+        return callback()
+    finally:
+        elapsed = perf_counter() - started_at
+        if elapsed >= _slow_log_threshold_seconds():
+            logger.warning("%s completed in %.2fs", label, elapsed)
+        else:
+            logger.debug("%s completed in %.2fs", label, elapsed)
+
+
 @dataclass
 class TurnResolution:
     updates: ActiveFilters
@@ -94,12 +113,15 @@ def get_chat_model(*, resolver: bool = False):
     use_ollama = getattr(settings, "USE_OLLAMA", False)
     ollama_host = getattr(settings, "OLLAMA_HOST", "http://127.0.0.1:11434")
     ollama_model = getattr(settings, "OLLAMA_MODEL", "gemma4:e2b")
+    ollama_timeout = float(getattr(settings, "OLLAMA_LLM_TIMEOUT_SECONDS", 20.0))
 
     if use_ollama:
         return ChatOllama(
             model=ollama_model,
             base_url=ollama_host,
             temperature=0,
+            sync_client_kwargs={"timeout": ollama_timeout},
+            async_client_kwargs={"timeout": ollama_timeout},
         )
 
     model_name = (
@@ -107,7 +129,11 @@ def get_chat_model(*, resolver: bool = False):
         if resolver
         else getattr(settings, "OPENAI_CHAT_MODEL", "gpt-4.1-mini")
     )
-    return ChatOpenAI(model=model_name, temperature=0)
+    return ChatOpenAI(
+        model=model_name,
+        temperature=0,
+        timeout=float(getattr(settings, "OPENAI_LLM_TIMEOUT_SECONDS", 20.0)),
+    )
 
 
 def generate_dynamic_thread_title(history_messages: list[str]) -> str:
@@ -120,7 +146,10 @@ def generate_dynamic_thread_title(history_messages: list[str]) -> str:
     
     chain = prompt | llm
     try:
-        response = chain.invoke({"history": "\n".join(history_messages[-5:])})
+        response = _timed_invoke(
+            "generate_dynamic_thread_title",
+            lambda: chain.invoke({"history": "\n".join(history_messages[-5:])}),
+        )
         return response.content.strip(' "”\'')[:255]
     except Exception as e:
         logger.error(f"Failed to generate thread title: {e}")
@@ -428,10 +457,18 @@ def _build_sport_filter_agent():
             "You resolve sport-specific filters from the user request.\n"
             "The user message is provided as JSON with user_message and current_filters.\n"
             "You must rely on the tool outputs and return only exact canonical values from them.\n"
+            "You must call the relevant tools before resolving catalog-backed fields like sport_types, tournament_names, teams, venue_names, featured_athletes, organizers, and match_numbers.\n"
+            "For sport_types specifically, you must call get_sport_types before returning any sport type.\n"
+            "If the user says 'cricket' and the tool returns 'Cricket', you must return 'Cricket' exactly as provided by the tool.\n"
+            "Do not return lowercase variants, paraphrases, reformatted values, or normalized values that differ from the tool output.\n"
+            "Only copy exact tool values into active_filters_partial.\n"
             "Only resolve a sport type, tournament, team, venue, or athlete when the user explicitly requests it or clearly describes it.\n"
             "Do not infer teams or venues from a city mention. For example, a message like 'Mumbai works better' updates city only and should not set teams or venues.\n"
             "If the user explicitly removes a sports filter like sport type, tournament, team, or venue, return status resolved with the relevant clear_fields and no replacement value for that field.\n"
             "Return sport_types, tournament_names, season_labels, competition_stages, format_labels, home_teams, away_teams, teams, participant_names, venue_names, featured_athletes, organizers, and match_numbers in active_filters_partial.\n"
+            "Example: if the user asks for 'cricket in delhi' and get_sport_types returns ['Badminton', 'Cricket', 'Football', 'Kabaddi'], return sport_types=['Cricket'].\n"
+            "Example: if the user asks for 'football' and get_sport_types returns ['Badminton', 'Cricket', 'Football', 'Kabaddi'], return sport_types=['Football'].\n"
+            "Invalid example: returning sport_types=['cricket'] when the tool value is 'Cricket'.\n"
             "If the message contains no sport-specific filter intent, return no_input."
         ),
     )
@@ -565,16 +602,19 @@ def _invoke_booking_selection_resolution(*, thread_id: str, user_message: str) -
     _thread, thread_filter = _get_booking_thread_state(thread_id)
 
     try:
-        response = _build_booking_selection_chain().invoke(
-            {
-                "payload": json.dumps(
-                    {
-                        "user_message": user_message,
-                        "active_filters": thread_filter.active_filters or {},
-                        "latest_result_context": thread_filter.latest_result_context or {},
-                    }
-                )
-            }
+        response = _timed_invoke(
+            "resolve_booking_selection",
+            lambda: _build_booking_selection_chain().invoke(
+                {
+                    "payload": json.dumps(
+                        {
+                            "user_message": user_message,
+                            "active_filters": thread_filter.active_filters or {},
+                            "latest_result_context": thread_filter.latest_result_context or {},
+                        }
+                    )
+                }
+            ),
         )
     except Exception as exc:
         logger.warning("resolve_booking_selection failed: %s", exc)
@@ -652,18 +692,21 @@ def _invoke_booking_confirmation_resolution(*, thread_id: str, user_message: str
     context = get_thread_booking_context(thread_filter=thread_filter)
 
     try:
-        response = _build_booking_confirmation_chain().invoke(
-            {
-                "payload": json.dumps(
-                    {
-                        "user_message": user_message,
-                        "active_filters": context.get("active_filters", {}),
-                        "pending_booking": context.get("pending_booking", {}),
-                        "missing_fields": context.get("missing_fields", []),
-                        "latest_result_context": context.get("latest_result_context", {}),
-                    }
-                )
-            }
+        response = _timed_invoke(
+            "resolve_booking_confirmation",
+            lambda: _build_booking_confirmation_chain().invoke(
+                {
+                    "payload": json.dumps(
+                        {
+                            "user_message": user_message,
+                            "active_filters": context.get("active_filters", {}),
+                            "pending_booking": context.get("pending_booking", {}),
+                            "missing_fields": context.get("missing_fields", []),
+                            "latest_result_context": context.get("latest_result_context", {}),
+                        }
+                    )
+                }
+            ),
         )
     except Exception as exc:
         logger.warning("resolve_booking_confirmation failed: %s", exc)
@@ -760,7 +803,8 @@ def _build_booking_user_info_chain():
                 "You handle the missing-user-info stage for a pending booking.\n"
                 "The user message is provided as JSON with user_message, active_filters, pending_booking, missing_fields, and latest_result_context.\n"
                 "Inspect pending_booking.awaiting_field and missing_fields.\n"
-                "If the user provides the missing value for pending_booking.awaiting_field in any language, return action booking_confirmed and place the raw user value in message exactly as provided.\n"
+                "If the user provides the missing value for pending_booking.awaiting_field in any language, return action booking_confirmed and populate captured_value with only the value that should be saved for that field.\n"
+                "Do not include framing words in captured_value. For example, 'my name is Nandan Kumar' should yield captured_value 'Nandan Kumar', 'email is nandan@example.com' should yield 'nandan@example.com', and 'my number is +91 9876543210' should yield '+91 9876543210'.\n"
                 "The application will validate and save that value, then decide whether more fields are needed or the booking can be confirmed.\n"
                 "If the user wants to switch to a different visible result, resolve it only from latest_result_context.results and return action selection_pending with the newly selected listing_code.\n"
                 "When the user switches events, do not treat it as a cancellation. The booking remains in progress with the new selected event.\n"
@@ -789,18 +833,21 @@ def _invoke_booking_user_info_resolution(*, thread_id: str, user_message: str) -
     awaited_field = str(pending_booking.get("awaiting_field", "") or "")
 
     try:
-        response = _build_booking_user_info_chain().invoke(
-            {
-                "payload": json.dumps(
-                    {
-                        "user_message": user_message,
-                        "active_filters": context.get("active_filters", {}),
-                        "pending_booking": pending_booking,
-                        "missing_fields": context.get("missing_fields", []),
-                        "latest_result_context": context.get("latest_result_context", {}),
-                    }
-                )
-            }
+        response = _timed_invoke(
+            "resolve_booking_user_info",
+            lambda: _build_booking_user_info_chain().invoke(
+                {
+                    "payload": json.dumps(
+                        {
+                            "user_message": user_message,
+                            "active_filters": context.get("active_filters", {}),
+                            "pending_booking": pending_booking,
+                            "missing_fields": context.get("missing_fields", []),
+                            "latest_result_context": context.get("latest_result_context", {}),
+                        }
+                    )
+                }
+            ),
         )
     except Exception as exc:
         logger.warning("resolve_booking_user_info failed: %s", exc)
@@ -844,14 +891,14 @@ def _invoke_booking_user_info_resolution(*, thread_id: str, user_message: str) -
         )
 
     if resolution.action == "booking_confirmed":
-        raw_value = user_message.strip()
+        captured_value = resolution.captured_value.strip() or user_message.strip()
         if not awaited_field:
             return BookingTurnResolution(action="none")
 
         saved = capture_thread_booking_user_info(
             thread_filter=thread_filter,
             field_name=awaited_field,
-            value=raw_value,
+            value=captured_value,
         )
         if saved["status"] == "invalid_user_info":
             return BookingTurnResolution(
@@ -980,6 +1027,82 @@ def _build_goal_state_chain():
     return prompt | structured_llm
 
 
+@lru_cache(maxsize=1)
+def _build_resolver_invocation_plan_chain():
+    llm = get_chat_model(resolver=True)
+    structured_llm = llm.with_structured_output(ResolverInvocationPlan)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You decide which resolver families need to run for the current event-planning turn.\n"
+                "The user message is provided as JSON with user_message, current_filters, pending_booking, latest_result_context, and turn_policy_intent.\n"
+                "This planner also decides whether the turn is a soft redirect or whether the booking-selection agent should be tried first.\n"
+                "Return intent temporary_distraction, out_of_scope, or meta_help only when the assistant should respond with a concise soft redirect instead of running normal search resolution.\n"
+                "When returning a soft redirect intent, set message to the user-facing redirect text and set should_keep_results appropriately.\n"
+                "Return should_try_booking_agent true only when there is no pending booking and the user is explicitly trying to book or pick one of the currently visible results.\n"
+                "For normal search or filter changes, keep should_try_booking_agent false.\n"
+                "Return booleans indicating only the resolver families needed for this turn.\n"
+                "Do not select unrelated resolver families.\n"
+                "For narrow location edits, replacements, removals, or broadening requests such as 'Mumbai instead', 'not Delhi', 'all cities', or 'in Mumbai', set run_location true and keep event type, temporal, and domain-specific filters false unless the user also explicitly changed them.\n"
+                "For narrow date or time edits such as 'next week instead', 'not Sunday', or 'after 7pm', set run_temporal true and keep event type, location, and domain-specific filters false unless the user also explicitly changed them.\n"
+                "Do not run movie or sport filters just to preserve the current domain. The application already keeps existing filters unless a resolver changes them.\n"
+                "Do not run event type resolution for pure location, date, time, venue, or other follow-up filter corrections unless the user explicitly changes the domain.\n"
+                "For domain switches such as movies instead of sports, include event type and the relevant domain-specific resolver.\n"
+                "If the user expresses a specific movie-only or sports-only filter without naming the domain directly, include the matching domain resolver so the application can infer the domain from grounded resolver output.\n"
+                "Only enable sport catalog inquiry when the user is asking informational questions about available sports or alternatives.\n"
+                "Keep the plan grounded in the current thread context and turn_policy_intent.\n"
+                "When unsure, it is better to run an extra resolver than to miss a needed one.\n"
+                "Return only the structured plan."
+            ),
+            ("user", "{payload}"),
+        ]
+    )
+    return prompt | structured_llm
+
+
+def _default_resolver_invocation_plan() -> ResolverInvocationPlan:
+    return ResolverInvocationPlan()
+
+
+def invoke_resolver_invocation_plan(
+    *,
+    user_message: str,
+    current_filters: ActiveFilters,
+    pending_booking: dict[str, object] | None = None,
+    latest_result_context: dict[str, object] | None = None,
+    turn_policy_intent: str = "task_continue",
+) -> ResolverInvocationPlan:
+    try:
+        response = _timed_invoke(
+            "resolve_resolver_plan",
+            lambda: _build_resolver_invocation_plan_chain().invoke(
+                {
+                    "payload": json.dumps(
+                        {
+                            "user_message": user_message,
+                            "current_filters": current_filters.model_dump(),
+                            "pending_booking": pending_booking or {},
+                            "latest_result_context": latest_result_context or {},
+                            "turn_policy_intent": turn_policy_intent,
+                        }
+                    )
+                }
+            ),
+        )
+    except Exception as exc:
+        logger.warning("resolve_resolver_plan failed: %s", exc)
+        return _default_resolver_invocation_plan()
+
+    if isinstance(response, ResolverInvocationPlan):
+        return response
+    try:
+        return ResolverInvocationPlan.model_validate(response)
+    except Exception as exc:
+        logger.warning("resolve_resolver_plan returned invalid structured response: %s", exc)
+        return _default_resolver_invocation_plan()
+
+
 def invoke_event_type_resolver(user_message: str) -> FilterResolution:
     return _invoke_filter_resolution_agent(
         agent=_build_event_type_agent(),
@@ -1106,8 +1229,11 @@ def invoke_sport_filter_resolver(user_message: str, current_filters: ActiveFilte
 
 def invoke_sport_catalog_inquiry(user_message: str) -> CatalogInquiry:
     try:
-        response = _build_sport_catalog_agent().invoke(
-            {"messages": [{"role": "user", "content": json.dumps({"user_message": user_message})}]}
+        response = _timed_invoke(
+            "resolve_sport_catalog_inquiry",
+            lambda: _build_sport_catalog_agent().invoke(
+                {"messages": [{"role": "user", "content": json.dumps({"user_message": user_message})}]}
+            ),
         )
     except Exception as exc:
         logger.warning("resolve_sport_catalog_inquiry failed: %s", exc)
@@ -1181,18 +1307,21 @@ def invoke_turn_policy(
     goal_state: dict[str, object] | None = None,
 ) -> TurnPolicy:
     try:
-        response = _build_turn_policy_chain().invoke(
-            {
-                "payload": json.dumps(
-                    {
-                        "user_message": user_message,
-                        "current_filters": current_filters.model_dump(),
-                        "pending_booking": pending_booking or {},
-                        "latest_result_context": latest_result_context or {},
-                        "goal_state": goal_state or {},
-                    }
-                )
-            }
+        response = _timed_invoke(
+            "resolve_turn_policy",
+            lambda: _build_turn_policy_chain().invoke(
+                {
+                    "payload": json.dumps(
+                        {
+                            "user_message": user_message,
+                            "current_filters": current_filters.model_dump(),
+                            "pending_booking": pending_booking or {},
+                            "latest_result_context": latest_result_context or {},
+                            "goal_state": goal_state or {},
+                        }
+                    )
+                }
+            ),
         )
     except Exception as exc:
         logger.warning("resolve_turn_policy failed: %s", exc)
@@ -1222,24 +1351,27 @@ def invoke_goal_state(
     existing_goal_state: dict[str, object] | None = None,
 ) -> GoalState:
     try:
-        response = _build_goal_state_chain().invoke(
-            {
-                "payload": json.dumps(
-                    {
-                        "user_message": user_message,
-                        "assistant_message": assistant_message,
-                        "active_filters": active_filters,
-                        "latest_result_context": latest_result_context or {},
-                        "pending_booking": pending_booking or {},
-                        "search_domains": search_domains,
-                        "needs_clarification": needs_clarification,
-                        "clarification_question": clarification_question,
-                        "booking_action": booking_action,
-                        "turn_policy_intent": turn_policy_intent,
-                        "existing_goal_state": existing_goal_state or {},
-                    }
-                )
-            }
+        response = _timed_invoke(
+            "resolve_goal_state",
+            lambda: _build_goal_state_chain().invoke(
+                {
+                    "payload": json.dumps(
+                        {
+                            "user_message": user_message,
+                            "assistant_message": assistant_message,
+                            "active_filters": active_filters,
+                            "latest_result_context": latest_result_context or {},
+                            "pending_booking": pending_booking or {},
+                            "search_domains": search_domains,
+                            "needs_clarification": needs_clarification,
+                            "clarification_question": clarification_question,
+                            "booking_action": booking_action,
+                            "turn_policy_intent": turn_policy_intent,
+                            "existing_goal_state": existing_goal_state or {},
+                        }
+                    )
+                }
+            ),
         )
     except Exception as exc:
         logger.warning("resolve_goal_state failed: %s", exc)
@@ -1376,6 +1508,10 @@ def resolve_turn_filters(
     user_message: str,
     current_filters: ActiveFilters,
     reference_date: str,
+    pending_booking: dict[str, object] | None = None,
+    latest_result_context: dict[str, object] | None = None,
+    turn_policy_intent: str = "task_continue",
+    resolver_plan: ResolverInvocationPlan | None = None,
 ) -> TurnResolution:
     trace: list[str] = []
     updates = ActiveFilters()
@@ -1385,29 +1521,44 @@ def resolve_turn_filters(
     domain_switched = False
     movie_resolution: FilterResolution | None = None
     sport_resolution: FilterResolution | None = None
-
-    event_type_resolution = invoke_event_type_resolver(user_message)
-    trace.append("resolve_event_type")
-    if _should_apply_event_type_resolution(
-        resolution=event_type_resolution,
-        current_domains=current_domains,
-    ):
-        updates = _merge_active_filters(updates, _partial_from_resolution(event_type_resolution))
-        domain_switched = bool(updates.event_types and updates.event_types != current_domains)
-        _append_resolution_issue(
-            issues=issues,
-            resolution=event_type_resolution,
-            trace_name="resolve_event_type",
-            filter_label="event type",
+    if resolver_plan is None:
+        resolver_plan = invoke_resolver_invocation_plan(
+            user_message=user_message,
+            current_filters=current_filters,
+            pending_booking=pending_booking,
+            latest_result_context=latest_result_context,
+            turn_policy_intent=turn_policy_intent,
         )
+
+    if resolver_plan.run_event_type:
+        event_type_resolution = invoke_event_type_resolver(user_message)
+        trace.append("resolve_event_type")
+        if _should_apply_event_type_resolution(
+            resolution=event_type_resolution,
+            current_domains=current_domains,
+        ):
+            updates = _merge_active_filters(updates, _partial_from_resolution(event_type_resolution))
+            domain_switched = bool(updates.event_types and updates.event_types != current_domains)
+            _append_resolution_issue(
+                issues=issues,
+                resolution=event_type_resolution,
+                trace_name="resolve_event_type",
+                filter_label="event type",
+            )
 
     effective_domains = updates.event_types or current_domains
 
-    if not effective_domains:
-        movie_resolution = invoke_movie_filter_resolver(user_message, current_filters=current_filters)
-        trace.append("resolve_movie_filters")
-        sport_resolution = invoke_sport_filter_resolver(user_message, current_filters=current_filters)
-        trace.append("resolve_sport_filters")
+    if not effective_domains and (resolver_plan.run_movie_filters or resolver_plan.run_sport_filters):
+        if resolver_plan.run_movie_filters:
+            movie_resolution = invoke_movie_filter_resolver(user_message, current_filters=current_filters)
+            trace.append("resolve_movie_filters")
+        else:
+            movie_resolution = FilterResolution(status="no_input")
+        if resolver_plan.run_sport_filters:
+            sport_resolution = invoke_sport_filter_resolver(user_message, current_filters=current_filters)
+            trace.append("resolve_sport_filters")
+        else:
+            sport_resolution = FilterResolution(status="no_input")
 
         inferred_domains = _infer_domains_from_specific_resolvers(
             movie_resolution=movie_resolution,
@@ -1427,28 +1578,30 @@ def resolve_turn_filters(
                 updates = _merge_active_filters(updates, _partial_from_resolution(sport_resolution))
                 clear_fields = _merge_clear_fields(clear_fields, sport_resolution.clear_fields)
 
-    location_resolution = invoke_location_resolver(user_message, effective_domains or None, current_filters)
-    location_resolution = _apply_location_clear_fallback(
-        resolution=location_resolution,
-        user_message=user_message,
-        current_filters=current_filters,
-    )
-    trace.append("resolve_location")
-    updates = _merge_active_filters(updates, _partial_from_resolution(location_resolution))
-    clear_fields = _merge_clear_fields(clear_fields, location_resolution.clear_fields)
-    _append_resolution_issue(
-        issues=issues,
-        resolution=location_resolution,
-        trace_name="resolve_location",
-        filter_label="location",
-    )
+    if resolver_plan.run_location:
+        location_resolution = invoke_location_resolver(user_message, effective_domains or None, current_filters)
+        location_resolution = _apply_location_clear_fallback(
+            resolution=location_resolution,
+            user_message=user_message,
+            current_filters=current_filters,
+        )
+        trace.append("resolve_location")
+        updates = _merge_active_filters(updates, _partial_from_resolution(location_resolution))
+        clear_fields = _merge_clear_fields(clear_fields, location_resolution.clear_fields)
+        _append_resolution_issue(
+            issues=issues,
+            resolution=location_resolution,
+            trace_name="resolve_location",
+            filter_label="location",
+        )
 
-    temporal_resolution = invoke_temporal_resolver(user_message, reference_date, current_filters)
-    trace.append("resolve_temporal")
-    updates = _merge_active_filters(updates, _partial_from_resolution(temporal_resolution))
-    clear_fields = _merge_clear_fields(clear_fields, temporal_resolution.clear_fields)
+    if resolver_plan.run_temporal:
+        temporal_resolution = invoke_temporal_resolver(user_message, reference_date, current_filters)
+        trace.append("resolve_temporal")
+        updates = _merge_active_filters(updates, _partial_from_resolution(temporal_resolution))
+        clear_fields = _merge_clear_fields(clear_fields, temporal_resolution.clear_fields)
 
-    if "movies" in effective_domains:
+    if "movies" in effective_domains and resolver_plan.run_movie_filters:
         if movie_resolution is None:
             movie_resolution = invoke_movie_filter_resolver(user_message, current_filters=current_filters)
             trace.append("resolve_movie_filters")
@@ -1462,7 +1615,11 @@ def resolve_turn_filters(
         )
 
     if "sports" in effective_domains:
-        if not domain_switched and _should_run_sport_catalog_inquiry(user_message):
+        if (
+            resolver_plan.run_sport_catalog_inquiry
+            and not domain_switched
+            and _should_run_sport_catalog_inquiry(user_message)
+        ):
             sport_catalog_inquiry = invoke_sport_catalog_inquiry(user_message)
             if sport_catalog_inquiry.status == "answer":
                 trace.append("resolve_sport_catalog_inquiry")
@@ -1472,24 +1629,28 @@ def resolve_turn_filters(
                 )
                 return TurnResolution(updates=updates, tool_trace=trace, clear_fields=clear_fields, issues=issues)
 
-        if sport_resolution is None:
+        if sport_resolution is None and resolver_plan.run_sport_filters:
             sport_resolution = invoke_sport_filter_resolver(user_message, current_filters=current_filters)
             trace.append("resolve_sport_filters")
-        updates = _merge_active_filters(updates, _partial_from_resolution(sport_resolution))
-        clear_fields = _merge_clear_fields(clear_fields, sport_resolution.clear_fields)
-        _append_resolution_issue(
-            issues=issues,
-            resolution=sport_resolution,
-            trace_name="resolve_sport_filters",
-            filter_label="sports filters",
-        )
+        if sport_resolution is not None:
+            updates = _merge_active_filters(updates, _partial_from_resolution(sport_resolution))
+            clear_fields = _merge_clear_fields(clear_fields, sport_resolution.clear_fields)
+            _append_resolution_issue(
+                issues=issues,
+                resolution=sport_resolution,
+                trace_name="resolve_sport_filters",
+                filter_label="sports filters",
+            )
 
     return TurnResolution(updates=updates, tool_trace=trace, clear_fields=clear_fields, issues=issues)
 
 
 def _invoke_filter_resolution_agent(*, agent, user_content: str, trace_name: str, allowed_fields: set[str]) -> FilterResolution:
     try:
-        response = agent.invoke({"messages": [{"role": "user", "content": user_content}]})
+        response = _timed_invoke(
+            trace_name,
+            lambda: agent.invoke({"messages": [{"role": "user", "content": user_content}]}),
+        )
     except Exception as exc:
         logger.warning("%s failed: %s", trace_name, exc)
         return FilterResolution(status="no_input", message=f"{trace_name} unavailable.")
