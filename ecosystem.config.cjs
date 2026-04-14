@@ -1,13 +1,17 @@
+const HOST = process.env.HOST || '127.0.0.1';
+const PORT = process.env.PORT || '8000';
+
 module.exports = {
   apps: [
     {
       name: 'attend-backend',
       cwd: './backend',
       script: './.venv/bin/gunicorn',
-      args: 'config.wsgi:application --bind 127.0.0.1:8000',
+      exec_interpreter: 'none',
+      args: `config.wsgi:application --bind ${HOST}:${PORT}`,
       env: {
-        HOST: '127.0.0.1',
-        PORT: '8000',
+        HOST,
+        PORT,
         PYTHONUNBUFFERED: '1',
       },
       autorestart: true,
