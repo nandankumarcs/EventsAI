@@ -100,6 +100,11 @@ export function ChatWorkspace({
           <span>{thread?.title ?? 'New conversation'}</span>
         </div>
         <div className="flex items-center gap-2">
+          {thread?.mode && thread.mode !== 'unknown' ? (
+            <Badge variant="default" className="capitalize">
+              {thread.mode}
+            </Badge>
+          ) : null}
           {thread?.status === 'booked' ? <Badge variant="success">Booking saved</Badge> : null}
         </div>
       </header>
@@ -500,15 +505,24 @@ type ResultCardProps = {
 }
 
 function ResultCard({ result, booked }: ResultCardProps) {
+  const isFlightResult = Boolean(result.origin_city && result.destination_city)
   const eventTypeLabel = result.sport_type ?? result.genres?.slice(0, 2).join(', ') ?? 'Event'
+  const flightSubtitle =
+    [result.airline_name, result.flight_number].filter(Boolean).join(' • ') || 'Flight'
 
   return (
     <div className="snap-start w-[272px] min-w-[272px] rounded-[24px] border border-border/70 bg-white/86 p-3.5 shadow-sm sm:w-[286px] sm:min-w-[286px]">
       <div className="space-y-2.5">
         <div className="space-y-1">
           <div>
-            <h3 className="text-[1.05rem] font-semibold leading-8 text-foreground">{result.title}</h3>
-            <p className="mt-1 text-sm text-muted-foreground">{eventTypeLabel}</p>
+            <h3 className="text-[1.05rem] font-semibold leading-8 text-foreground">
+              {isFlightResult
+                ? `${result.origin_city} to ${result.destination_city}`
+                : result.title}
+            </h3>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {isFlightResult ? flightSubtitle : eventTypeLabel}
+            </p>
           </div>
         </div>
 
@@ -516,19 +530,28 @@ function ResultCard({ result, booked }: ResultCardProps) {
           <div className="flex items-center gap-2">
             <MapPin className="size-4 text-primary" />
             <span>
-              {result.venue_name}, {result.city}
+              {isFlightResult
+                ? `${result.origin_city} -> ${result.destination_city}`
+                : `${result.venue_name}, ${result.city}`}
             </span>
           </div>
           <div className="flex items-center gap-2">
             <CalendarDays className="size-4 text-primary" />
             <span>{formatEventDateTime(result.event_date, result.start_at)}</span>
           </div>
+          {isFlightResult ? (
+            <div className="text-xs">
+              {result.cabin_class || 'Cabin N/A'}
+              {typeof result.stops === 'number' ? ` • ${result.stops} stop(s)` : ''}
+            </div>
+          ) : null}
         </div>
 
-        {(result.min_price ?? result.max_price) ? (
+        {(result.total_amount ?? result.min_price ?? result.max_price) ? (
           <p className="text-sm font-medium text-foreground">
-            Rs. {result.min_price ?? 0}
-            {result.max_price ? ` - ${result.max_price}` : ''}
+            {result.total_amount
+              ? `Rs. ${result.total_amount}`
+              : `Rs. ${result.min_price ?? 0}${result.max_price ? ` - ${result.max_price}` : ''}`}
           </p>
         ) : null}
 
@@ -586,6 +609,13 @@ function normalizePendingBookingResult(pendingBooking: PendingBooking): SearchRe
     max_price: snapshot.max_price ?? undefined,
     genres: snapshot.genres,
     sport_type: snapshot.sport_type ?? undefined,
+    origin_city: snapshot.origin_city ?? undefined,
+    destination_city: snapshot.destination_city ?? undefined,
+    airline_name: snapshot.airline_name ?? undefined,
+    flight_number: snapshot.flight_number ?? undefined,
+    cabin_class: snapshot.cabin_class ?? undefined,
+    stops: typeof snapshot.stops === 'number' ? snapshot.stops : undefined,
+    total_amount: snapshot.total_amount ?? undefined,
   }
 }
 
@@ -615,6 +645,13 @@ function getSelectedBookingResult(message: ThreadMessage): SearchResultItem | nu
     max_price: snapshot.max_price ?? undefined,
     genres: snapshot.genres,
     sport_type: snapshot.sport_type ?? undefined,
+    origin_city: snapshot.origin_city ?? undefined,
+    destination_city: snapshot.destination_city ?? undefined,
+    airline_name: snapshot.airline_name ?? undefined,
+    flight_number: snapshot.flight_number ?? undefined,
+    cabin_class: snapshot.cabin_class ?? undefined,
+    stops: typeof snapshot.stops === 'number' ? snapshot.stops : undefined,
+    total_amount: snapshot.total_amount ?? undefined,
   }
 }
 

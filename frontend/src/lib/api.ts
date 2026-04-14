@@ -28,11 +28,18 @@ export type SearchResultItem = {
   tournament_name?: string
   home_team?: string
   away_team?: string
+  origin_city?: string
+  destination_city?: string
+  airline_name?: string
+  flight_number?: string
+  cabin_class?: string
+  stops?: number
+  total_amount?: string | null
 }
 
 export type ResultContextItem = {
   position: number
-  domain: 'movies' | 'sports' | string
+  domain: 'movies' | 'sports' | 'flights' | string
   listing_code: string
   title: string
   city: string
@@ -43,6 +50,13 @@ export type ResultContextItem = {
   max_price?: number | null
   sport_type?: string | null
   genres?: string[]
+  origin_city?: string
+  destination_city?: string
+  airline_name?: string
+  flight_number?: string
+  cabin_class?: string
+  stops?: number
+  total_amount?: string | null
 }
 
 export type PendingBooking = {
@@ -80,7 +94,7 @@ export type SearchDomainResult = {
 }
 
 export type SearchResultsByDomain = Partial<
-  Record<'movies' | 'sports', SearchDomainResult>
+  Record<'movies' | 'sports' | 'flights', SearchDomainResult>
 >
 
 export type ThreadMessage = {
@@ -112,6 +126,7 @@ export type ThreadMessage = {
 export type ThreadSummary = {
   id: string
   title: string
+  mode: 'unknown' | 'entertainment' | 'flights'
   status: 'active' | 'booked' | 'archived'
   summary: string
   last_message_preview: string
@@ -152,7 +167,7 @@ export type ThreadDetailResponse = {
 export type ChatTurnResponse = {
   thread: Pick<
     ThreadSummary,
-    'id' | 'title' | 'status' | 'last_message_preview' | 'last_activity_at'
+    'id' | 'title' | 'mode' | 'status' | 'last_message_preview' | 'last_activity_at'
   >
   assistant_message: {
     id: string
@@ -251,7 +266,7 @@ export async function fetchThread(threadId: string) {
 }
 
 export async function sendChatMessage(message: string, threadId?: string) {
-  return request<ChatTurnResponse>('/api/agents/chat/', {
+  return request<ChatTurnResponse>('/api/chats/chat/', {
     method: 'POST',
     body: JSON.stringify({
       message,

@@ -5,6 +5,11 @@ from apps.core.models import UUIDTimeStampedModel
 
 
 class ChatThread(UUIDTimeStampedModel):
+    class Mode(models.TextChoices):
+        UNKNOWN = "unknown", "Unknown"
+        ENTERTAINMENT = "entertainment", "Entertainment"
+        FLIGHTS = "flights", "Flights"
+
     class Status(models.TextChoices):
         ACTIVE = "active", "Active"
         BOOKED = "booked", "Booked"
@@ -13,6 +18,7 @@ class ChatThread(UUIDTimeStampedModel):
 
     title = models.CharField(max_length=255)
     summary = models.TextField(blank=True)
+    mode = models.CharField(max_length=24, choices=Mode, default=Mode.UNKNOWN)
     status = models.CharField(max_length=24, choices=Status, default=Status.ACTIVE)
     last_message_preview = models.CharField(max_length=500, blank=True)
     last_activity_at = models.DateTimeField(default=timezone.now)

@@ -607,6 +607,7 @@ def _get_or_create_thread(*, user_message: str, thread_id: str | None) -> tuple[
     title = user_message.strip()[:80] or "New thread"
     thread = ChatThread.objects.create(
         title=title,
+        mode=ChatThread.Mode.ENTERTAINMENT,
         last_message_preview=user_message[:500],
         last_activity_at=timezone.now(),
     )
@@ -919,6 +920,7 @@ def _serialize_thread(thread: ChatThread) -> dict[str, Any]:
     return {
         "id": str(thread.id),
         "title": thread.title,
+        "mode": thread.mode,
         "status": thread.status,
         "last_message_preview": thread.last_message_preview,
         "last_activity_at": thread.last_activity_at.isoformat(),

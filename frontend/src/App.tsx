@@ -300,6 +300,7 @@ function App() {
       setSelectedThread({
         id: 'temp-new-thread',
         title: 'New conversation',
+        mode: 'unknown',
         status: 'active',
         summary: '',
         last_message_preview: message,

@@ -5,6 +5,8 @@ from django.http import HttpRequest, HttpResponseNotAllowed, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.chats.models import ChatThread, ThreadFilter
+from apps.chats.services import process_unified_chat_turn
+from apps.agents.services import ChatTurnError
 
 
 @csrf_exempt
@@ -39,8 +41,16 @@ def thread_list_create_view(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": f"Invalid thread payload: {exc}"}, status=400)
 
     title = (payload.get("title") or "").strip() or "New thread"
+    mode = payload.get("mode") or ChatThread.Mode.UNKNOWN
+    if mode not in {
+        ChatThread.Mode.UNKNOWN,
+        ChatThread.Mode.ENTERTAINMENT,
+        ChatThread.Mode.FLIGHTS,
+    }:
+        return JsonResponse({"error": "Invalid thread mode"}, status=400)
     thread = ChatThread.objects.create(
         title=title[:255],
+        mode=mode,
         last_message_preview="",
     )
     ThreadFilter.objects.get_or_create(thread=thread)
@@ -83,10 +93,19 @@ def _serialize_thread_summary(thread: ChatThread) -> dict[str, object]:
                 "email": booking.customer_email,
                 "contact_number": booking.customer_contact_number,
             }
+    if not customer_info:
+        flight_booking = thread.flight_bookings.order_by("-confirmed_at").first()
+        if flight_booking:
+            customer_info = {
+                "name": flight_booking.passenger_name,
+                "email": flight_booking.passenger_email,
+                "contact_number": flight_booking.passenger_contact_number,
+            }
 
     return {
         "id": str(thread.id),
         "title": thread.title,
+        "mode": thread.mode,
         "status": thread.status,
         "summary": thread.summary,
         "last_message_preview": thread.last_message_preview,
@@ -118,3 +137,26 @@ def _serialize_thread_detail(thread: ChatThread) -> dict[str, object]:
             for message in thread.messages.order_by("position", "created_at")
         ],
     }
+
+
+@csrf_exempt
+def chat_turn_view(request: HttpRequest) -> JsonResponse:
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+
+    try:
+        payload = json.loads(request.body.decode("utf-8"))
+    except (JSONDecodeError, UnicodeDecodeError) as exc:
+        return JsonResponse({"error": f"Invalid chat payload: {exc}"}, status=400)
+
+    message = (payload.get("message") or "").strip()
+    thread_id = payload.get("thread_id")
+
+    if not message:
+        return JsonResponse({"error": "message is required"}, status=400)
+
+    try:
+        result = process_unified_chat_turn(user_message=message, thread_id=thread_id)
+    except ChatTurnError as exc:
+        return JsonResponse({"error": str(exc)}, status=exc.status_code)
+    return JsonResponse(result)

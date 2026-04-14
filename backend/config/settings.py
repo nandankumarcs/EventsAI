@@ -39,6 +39,17 @@ DB_CONN_MAX_AGE = int(os.getenv("DB_CONN_MAX_AGE", "0" if get_bool("DJANGO_DEBUG
 OPENAI_LLM_TIMEOUT_SECONDS = get_float("OPENAI_LLM_TIMEOUT_SECONDS", 20.0)
 OLLAMA_LLM_TIMEOUT_SECONDS = get_float("OLLAMA_LLM_TIMEOUT_SECONDS", OPENAI_LLM_TIMEOUT_SECONDS)
 AGENT_SLOW_LOG_SECONDS = get_float("AGENT_SLOW_LOG_SECONDS", 2.5)
+AVIATIONSTACK_BASE_URL = os.getenv("AVIATIONSTACK_BASE_URL", "https://api.aviationstack.com/v1")
+AVIATIONSTACK_ACCESS_KEY = os.getenv("AVIATIONSTACK_ACCESS_KEY", "")
+AVIATIONSTACK_TIMEOUT_SECONDS = get_float("AVIATIONSTACK_TIMEOUT_SECONDS", 20.0)
+OPENFLIGHTS_AIRPORTS_URL = os.getenv(
+    "OPENFLIGHTS_AIRPORTS_URL",
+    "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat",
+)
+OPENFLIGHTS_AIRLINES_URL = os.getenv(
+    "OPENFLIGHTS_AIRLINES_URL",
+    "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airlines.dat",
+)
 
 # Ollama configuration (for local Gemma 4)
 USE_OLLAMA = get_bool("USE_OLLAMA", False)
@@ -70,6 +81,7 @@ INSTALLED_APPS = [
     "apps.core.apps.CoreConfig",
     "apps.chats.apps.ChatsConfig",
     "apps.events.apps.EventsConfig",
+    "apps.flights.apps.FlightsConfig",
     "apps.bookings.apps.BookingsConfig",
     "apps.agents.apps.AgentsConfig",
 ]

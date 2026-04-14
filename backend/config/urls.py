@@ -34,6 +34,7 @@ urlpatterns = [
     path("api/", include("apps.core.urls")),
     path("api/chats/", include("apps.chats.urls")),
     path("api/events/", include("apps.events.urls")),
+    path("api/flights/", include("apps.flights.urls")),
     path("api/agents/", include("apps.agents.urls")),
     path("api/bookings/", include("apps.bookings.urls")),
     # Root-level static files from the dist folder (favicon, icons, etc.)
