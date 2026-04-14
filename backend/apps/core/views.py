@@ -1,6 +1,9 @@
 from django.db import connection
 from django.http import JsonResponse
 from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+
+from apps.core.ttl_cache import cache
 
 
 def health_check(request):
@@ -26,6 +29,24 @@ def health_check(request):
             "service": "eventsai-backend",
             "timestamp": timezone.now().isoformat(),
             "database": database,
+        }
+    )
+
+
+@csrf_exempt
+def reset_node_cache(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    before = cache.stats()
+    cache.clear()
+    after = cache.stats()
+    return JsonResponse(
+        {
+            "status": "ok",
+            "cache": "ttl_cache",
+            "before": before.__dict__,
+            "after": after.__dict__,
         }
     )
 
