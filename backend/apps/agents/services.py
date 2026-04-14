@@ -67,9 +67,10 @@ class ChatTurnError(Exception):
 
 
 def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dict[str, Any]:
+    reference_date = timezone.localdate().isoformat()
+    thread, _created = _get_or_create_thread(user_message=user_message, thread_id=thread_id)
+
     with transaction.atomic():
-        reference_date = timezone.localdate().isoformat()
-        thread, _created = _get_or_create_thread(user_message=user_message, thread_id=thread_id)
         _assert_thread_accepts_messages(thread)
         thread_filter = _get_or_create_thread_filter(thread, lock=True)
         current_filters = ActiveFilters.model_validate(thread_filter.active_filters or {})
@@ -79,16 +80,23 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
 
         _append_message(thread, role=ChatMessage.Role.USER, content=user_message, metadata={})
 
-        resolver_plan = None
-        if has_pending_booking:
-            turn_policy = invoke_turn_policy(
-                user_message=user_message,
-                current_filters=current_filters,
-                pending_booking=thread_filter.pending_booking,
-                latest_result_context=thread_filter.latest_result_context,
-                goal_state=existing_goal_state,
-            )
-            if turn_policy.intent in {"temporary_distraction", "out_of_scope", "meta_help"}:
+        pending_booking_snapshot = dict(thread_filter.pending_booking or {})
+        latest_result_context_snapshot = dict(thread_filter.latest_result_context or {})
+
+    resolver_plan = None
+    if has_pending_booking:
+        turn_policy = invoke_turn_policy(
+            user_message=user_message,
+            current_filters=current_filters,
+            pending_booking=pending_booking_snapshot,
+            latest_result_context=latest_result_context_snapshot,
+            goal_state=existing_goal_state,
+        )
+        if turn_policy.intent in {"temporary_distraction", "out_of_scope", "meta_help"}:
+            with transaction.atomic():
+                thread.refresh_from_db()
+                _assert_thread_accepts_messages(thread)
+                thread_filter = _get_or_create_thread_filter(thread, lock=True)
                 return _process_soft_redirect_turn(
                     thread=thread,
                     thread_filter=thread_filter,
@@ -97,22 +105,26 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
                     user_message=user_message,
                     existing_goal_state=existing_goal_state,
                 )
-        else:
-            from apps.agents.langchain_tools import invoke_resolver_invocation_plan
+    else:
+        from apps.agents.langchain_tools import invoke_resolver_invocation_plan
 
-            resolver_plan = invoke_resolver_invocation_plan(
-                user_message=user_message,
-                current_filters=current_filters,
-                pending_booking=thread_filter.pending_booking,
-                latest_result_context=thread_filter.latest_result_context,
-                turn_policy_intent="task_continue",
-            )
-            turn_policy = SimpleNamespace(
-                intent=resolver_plan.intent,
-                message=resolver_plan.message,
-                should_keep_results=resolver_plan.should_keep_results,
-            )
-            if turn_policy.intent in {"temporary_distraction", "out_of_scope", "meta_help"}:
+        resolver_plan = invoke_resolver_invocation_plan(
+            user_message=user_message,
+            current_filters=current_filters,
+            pending_booking=pending_booking_snapshot,
+            latest_result_context=latest_result_context_snapshot,
+            turn_policy_intent="task_continue",
+        )
+        turn_policy = SimpleNamespace(
+            intent=resolver_plan.intent,
+            message=resolver_plan.message,
+            should_keep_results=resolver_plan.should_keep_results,
+        )
+        if turn_policy.intent in {"temporary_distraction", "out_of_scope", "meta_help"}:
+            with transaction.atomic():
+                thread.refresh_from_db()
+                _assert_thread_accepts_messages(thread)
+                thread_filter = _get_or_create_thread_filter(thread, lock=True)
                 return _process_soft_redirect_turn(
                     thread=thread,
                     thread_filter=thread_filter,
@@ -122,10 +134,25 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
                     existing_goal_state=existing_goal_state,
                 )
 
+    booking_resolution = BookingTurnResolution(action="none")
+    if has_pending_booking and turn_policy.intent in {"task_continue", "booking_change", "follow_up_about_results"}:
+        booking_resolution = invoke_booking_agent(thread_id=str(thread.id), user_message=user_message)
+    elif not has_pending_booking and resolver_plan and resolver_plan.should_try_booking_agent:
+        booking_resolution = invoke_booking_agent(thread_id=str(thread.id), user_message=user_message)
+
+    if booking_resolution.action == "no_match" and not has_pending_booking:
         booking_resolution = BookingTurnResolution(action="none")
-        if has_pending_booking and turn_policy.intent in {"task_continue", "booking_change", "follow_up_about_results"}:
-            booking_resolution = invoke_booking_agent(thread_id=str(thread.id), user_message=user_message)
-            thread_filter.refresh_from_db()
+
+    if booking_resolution.action != "none":
+        with transaction.atomic():
+            thread.refresh_from_db()
+            if thread.status == ChatThread.Status.ARCHIVED:
+                raise ChatTurnError(
+                    "This thread is archived and cannot accept new messages.",
+                    status_code=409,
+                )
+            thread_filter = _get_or_create_thread_filter(thread, lock=True)
+
             booking_resolution = _reconcile_booking_resolution(
                 user_message=user_message,
                 booking_resolution=booking_resolution,
@@ -134,18 +161,7 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
                 current_filters=current_filters,
                 reference_date=reference_date,
             )
-        elif not has_pending_booking and resolver_plan and resolver_plan.should_try_booking_agent:
-            booking_resolution = invoke_booking_agent(thread_id=str(thread.id), user_message=user_message)
-            thread_filter.refresh_from_db()
-            booking_resolution = _reconcile_booking_resolution(
-                user_message=user_message,
-                booking_resolution=booking_resolution,
-                thread_filter=thread_filter,
-                pending_booking_before_turn=pending_booking_before_turn,
-                current_filters=current_filters,
-                reference_date=reference_date,
-            )
-        if booking_resolution.action != "none":
+
             show_booking_results = booking_resolution.action == "booking_cleared"
             booking_results_by_domain = (
                 _results_by_domain_from_latest_context(thread_filter.latest_result_context)
@@ -157,8 +173,7 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
                 if show_booking_results
                 else []
             )
-            thread.refresh_from_db()
-            thread_filter.refresh_from_db()
+
             needs_clarification = booking_resolution.action in {"ambiguous", "no_match"}
             clarification_question = booking_resolution.message if needs_clarification else None
             goal_state = invoke_goal_state(
@@ -212,15 +227,15 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
                 "goal_state": goal_state.model_dump(),
             }
 
-        turn_resolution = resolve_turn_filters(
-            current_filters=current_filters,
-            user_message=user_message,
-            reference_date=reference_date,
-            pending_booking=thread_filter.pending_booking,
-            latest_result_context=thread_filter.latest_result_context,
-            turn_policy_intent=turn_policy.intent,
-            resolver_plan=resolver_plan,
-        )
+    turn_resolution = resolve_turn_filters(
+        current_filters=current_filters,
+        user_message=user_message,
+        reference_date=reference_date,
+        pending_booking=pending_booking_snapshot,
+        latest_result_context=latest_result_context_snapshot,
+        turn_policy_intent=turn_policy.intent,
+        resolver_plan=resolver_plan,
+    )
     filters_to_clear = _derive_filters_to_clear(
         current_filters=current_filters,
         updates=turn_resolution.updates,
@@ -266,27 +281,32 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
                     issue=ambiguity_issue,
                 )
 
-    thread_filter.active_filters = _compact_filter_state(merged_filters.model_dump())
-    thread_filter.latest_result_context = build_latest_result_context(
-        thread=thread,
-        search_domains=search_domains,
-        results_by_domain=results_by_domain,
-    )
-    thread_filter.pending_booking = {}
-    thread_filter.resolver_trace = turn_resolution.tool_trace
-    thread_filter.version += 1
-    thread_filter.last_resolved_at = timezone.now()
-    thread_filter.save(
-        update_fields=[
-            "active_filters",
-            "latest_result_context",
-            "pending_booking",
-            "resolver_trace",
-            "version",
-            "last_resolved_at",
-            "updated_at",
-        ]
-    )
+    with transaction.atomic():
+        thread.refresh_from_db()
+        _assert_thread_accepts_messages(thread)
+        thread_filter = _get_or_create_thread_filter(thread, lock=True)
+
+        thread_filter.active_filters = _compact_filter_state(merged_filters.model_dump())
+        thread_filter.latest_result_context = build_latest_result_context(
+            thread=thread,
+            search_domains=search_domains,
+            results_by_domain=results_by_domain,
+        )
+        thread_filter.pending_booking = {}
+        thread_filter.resolver_trace = turn_resolution.tool_trace
+        thread_filter.version += 1
+        thread_filter.last_resolved_at = timezone.now()
+        thread_filter.save(
+            update_fields=[
+                "active_filters",
+                "latest_result_context",
+                "pending_booking",
+                "resolver_trace",
+                "version",
+                "last_resolved_at",
+                "updated_at",
+            ]
+        )
 
     assistant_metadata = {
         "needs_clarification": needs_clarification,
@@ -321,33 +341,39 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
         turn_policy_intent=turn_policy.intent,
         existing_goal_state=existing_goal_state,
     )
-    _persist_thread_goal_state(thread, goal_state.model_dump())
     assistant_metadata["goal_state"] = goal_state.model_dump()
-    assistant_message = _append_message(
-        thread,
-        role=ChatMessage.Role.ASSISTANT,
-        content=assistant_content,
-        metadata=assistant_metadata,
-    )
 
-    thread.last_message_preview = assistant_content[:500]
-    thread.last_activity_at = timezone.now()
-    thread.save(update_fields=["last_message_preview", "last_activity_at", "updated_at", "metadata"])
+    with transaction.atomic():
+        thread.refresh_from_db()
+        _assert_thread_accepts_messages(thread)
+        thread_filter = _get_or_create_thread_filter(thread, lock=True)
 
-    _update_dynamic_thread_title(thread)
+        _persist_thread_goal_state(thread, goal_state.model_dump())
+        assistant_message = _append_message(
+            thread,
+            role=ChatMessage.Role.ASSISTANT,
+            content=assistant_content,
+            metadata=assistant_metadata,
+        )
 
-    return {
-        "thread": _serialize_thread(thread),
-        "assistant_message": _serialize_message(assistant_message),
-        "active_filters": thread_filter.active_filters,
-        "search_domains": search_domains,
-        "results_by_domain": results_by_domain,
-        "latest_result_context": thread_filter.latest_result_context,
-        "pending_booking": thread_filter.pending_booking,
-        "needs_clarification": needs_clarification,
-        "clarification_question": clarification_question,
-        "goal_state": goal_state.model_dump(),
-    }
+        thread.last_message_preview = assistant_content[:500]
+        thread.last_activity_at = timezone.now()
+        thread.save(update_fields=["last_message_preview", "last_activity_at", "updated_at", "metadata"])
+
+        _update_dynamic_thread_title(thread)
+
+        return {
+            "thread": _serialize_thread(thread),
+            "assistant_message": _serialize_message(assistant_message),
+            "active_filters": thread_filter.active_filters,
+            "search_domains": search_domains,
+            "results_by_domain": results_by_domain,
+            "latest_result_context": thread_filter.latest_result_context,
+            "pending_booking": thread_filter.pending_booking,
+            "needs_clarification": needs_clarification,
+            "clarification_question": clarification_question,
+            "goal_state": goal_state.model_dump(),
+        }
 
 
 def _process_soft_redirect_turn(
@@ -628,6 +654,44 @@ def _update_dynamic_thread_title(thread: ChatThread) -> None:
             thread.save(update_fields=["title", "updated_at"])
             thread.refresh_from_db(fields=["title", "updated_at"])
         return
+
+    thread_filter = ThreadFilter.objects.filter(thread=thread).first()
+    pending_booking = dict((thread_filter.pending_booking or {}) if thread_filter else {})
+    pending_snapshot = dict((pending_booking.get("event_snapshot") or {}) if pending_booking else {})
+    pending_title = str(pending_snapshot.get("title", "") or "").strip()
+    if pending_title:
+        next_title = f"Book {pending_title}"[:255]
+        if next_title and thread.title != next_title:
+            thread.title = next_title
+            thread.save(update_fields=["title", "updated_at"])
+            thread.refresh_from_db(fields=["title", "updated_at"])
+        return
+
+    active_filters = dict((thread_filter.active_filters or {}) if thread_filter else {})
+    if active_filters:
+        event_types = [str(item) for item in (active_filters.get("event_types") or []) if str(item).strip()]
+        cities = [str(item) for item in (active_filters.get("cities") or []) if str(item).strip()]
+        sport_types = [str(item) for item in (active_filters.get("sport_types") or []) if str(item).strip()]
+        titles = [str(item) for item in (active_filters.get("titles") or []) if str(item).strip()]
+
+        parts: list[str] = []
+        if titles:
+            parts.append(titles[0])
+        elif sport_types:
+            parts.append(sport_types[0])
+        elif event_types:
+            parts.append(event_types[0])
+
+        if cities:
+            parts.append(cities[0])
+
+        if parts:
+            next_title = " ".join(parts)[:255]
+            if next_title and thread.title != next_title:
+                thread.title = next_title
+                thread.save(update_fields=["title", "updated_at"])
+                thread.refresh_from_db(fields=["title", "updated_at"])
+            return
 
     from django.conf import settings
 

@@ -157,6 +157,7 @@ class ResolverInvocationPlan(BaseModel):
     ] = "task_continue"
     message: str = ""
     should_keep_results: bool = False
+    search_domains: list[Literal["movies", "sports"]] = Field(default_factory=list)
     should_try_booking_agent: bool = False
     run_event_type: bool = True
     run_location: bool = True

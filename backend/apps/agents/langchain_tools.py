@@ -140,7 +140,14 @@ def generate_dynamic_thread_title(history_messages: list[str]) -> str:
     llm = get_chat_model(resolver=True)
     
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a concise title generator. Based on the user's chat history, provide a 2 to 5 word title that best summarizes the main topic of the conversation. Do not use quotes, punctuation, or generic terms like 'Chat about'."),
+        (
+            "system",
+            "You are a concise title generator for an event discovery and booking assistant. "
+            "Based on the user's chat history, provide a 2 to 5 word title that summarizes the planning topic. "
+            "If the history contains any event-planning intent (movies, sports, matches, booking, cities, dates), prefer that over any temporary distraction. "
+            "Do not title the thread based on off-topic requests like poems, jokes, or small talk if there is any planning context present. "
+            "Do not use quotes, punctuation, or generic terms like 'Chat about'."
+        ),
         ("user", "Conversation history:\n{history}")
     ])
     
@@ -205,6 +212,7 @@ def _build_location_agent():
             "If the user asks to remove, exclude, or go outside the current city filter, return status resolved with clear_fields set to ['cities'] and leave active_filters_partial.cities empty.\n"
             "If the user says 'all cities', 'any city', 'not just Mumbai', 'not only Mumbai', 'across all cities', or otherwise broadens beyond the current city restriction, return status resolved with clear_fields set to ['cities'] and leave active_filters_partial.cities empty.\n"
             "If the user replaces one city with another, return only the replacement city value.\n"
+            "Mixed-language replacements must be treated as replacements too. For example, 'Mumbai nahi Delhi' or 'Mumbai नहीं Delhi' means replace Mumbai with Delhi.\n"
         ),
     )
 
@@ -362,6 +370,7 @@ def _build_movie_filter_agent():
             "Only resolve values the user explicitly requested or clearly described.\n"
             "Do not infer a venue, title, genre, or language from a city mention alone.\n"
             "If the user explicitly removes a movie filter like language, venue, genre, format, or title, return status resolved with the relevant clear_fields and no replacement value for that field.\n"
+            "If the user explicitly requests a movie format and it is not present in get_movie_formats, return status no_match with a message explaining the format is not available and include candidates listing the available formats.\n"
             "Return titles, genres, cast_members, directors, certifications, languages, venue_names, formats, franchises, and content_origins in active_filters_partial.\n"
             "If the message contains no movie-specific filter intent, return no_input."
         ),
@@ -578,6 +587,8 @@ def _build_booking_selection_chain():
                 "There is no pending booking before this turn.\n"
                 "The user message is provided as JSON with user_message, active_filters, and latest_result_context.\n"
                 "Use only latest_result_context.results to resolve references like 'book the second one', 'book the Mumbai one', 'book Kalki', or 'book the Chennai match'. Never invent or search outside it.\n"
+                "If latest_result_context.results contains exactly one visible result and the user says 'book this one' or similar, select that single result and return action selection_pending with its listing_code.\n"
+                "If latest_result_context.results is empty and the user is trying to book, return action no_match with a message asking them to run a search first.\n"
                 "Treat direct selection phrases as booking-selection requests, including examples like 'book the first one', 'pick the one in Guwahati', 'reserve Kalki', 'पहला वाला बुक करो', and 'इसको बुक करो'. Returning action none for those requests is incorrect.\n"
                 "If the user is changing the search instead of choosing a visible result, return action none.\n"
                 "Messages like 'Actually Mumbai again', 'No wait Pune', 'Delhi instead', 'this week not Sunday', 'Show cricket matches', 'show movies instead', or 'Bengaluru nahi Chennai' are search changes, not booking-selection requests, unless the user explicitly asks to book or pick a visible result.\n"
@@ -667,7 +678,7 @@ def _build_booking_confirmation_chain():
                 "You handle booking confirmation for a thread that already has a pending booking awaiting confirmation.\n"
                 "The user message is provided as JSON with user_message, active_filters, pending_booking, missing_fields, and latest_result_context.\n"
                 "If the user says yes, confirm, go ahead, or otherwise approves the selected event in any language, return action booking_confirmed.\n"
-                "If the selected event still needs user details first, still return booking_confirmed. The application will decide whether confirmation can proceed or if user info is missing.\n"
+                "If missing_fields is non-empty and the user approves the booking, still return booking_confirmed, but make the user-facing message explicitly ask for the next missing field after acknowledging the confirmation.\n"
                 "If the user explicitly rejects or cancels the selected event, return action booking_cleared.\n"
                 "If the user says they want a different movie, different event, different match, another option, or wants to pick again without naming a replacement yet, return action booking_cleared so the app can restore the current results and let them choose again.\n"
                 "Examples include 'I want a different movie', 'show me other movies', 'another one', 'not this, something else', 'different match', or 'pick a different one'.\n"
@@ -811,8 +822,10 @@ def _build_booking_user_info_chain():
                 "If the user explicitly rejects or cancels the pending booking, return action booking_cleared.\n"
                 "If the user says they want a different movie, different event, different match, another option, or wants to pick again without naming a replacement yet, return action booking_cleared so the app can restore the current results and let them choose again.\n"
                 "Examples include 'I want a different movie', 'show me other movies', 'another one', 'not this, something else', 'different match', or 'pick a different one'.\n"
+                "Treat phrases like 'book the other one instead' or 'pick the other one instead' (without specifying which one) as booking_cleared.\n"
                 "If the user is clearly changing the search instead of answering the awaited field, return action none so the normal search flow can continue.\n"
                 "Treat messages like 'show football instead', 'movies instead', 'Mumbai nahi Delhi', 'this week not Sunday', or 'kal ka dikhana' as search changes. Do not clear the booking for those; return action none.\n"
+                "Treat messages like 'Actually book the Delhi one instead' as a search change (city correction) rather than an awaited-field answer; return action none.\n"
                 "Treat only explicit cancellation phrases like 'cancel this booking', 'don't book this', 'not this one', 'नहीं इसे बुक मत करो', or 'बुकिंग रद्द करो' as booking_cleared.\n"
                 "Examples of valid awaited-field answers include names, emails, and phone numbers in any language or script, such as 'Nandan Kumar', 'नंदन कुमार', 'nandan@example.com', or '9876543210'.\n"
                 "If the message is unrelated to the awaited field and not a search change, return action awaiting_user_info with requested_field set to the current awaited field and remind the user what is still needed.\n"
@@ -989,8 +1002,12 @@ def _build_turn_policy_chain():
                 "Return out_of_scope when the user requests something unrelated to event discovery or booking, such as writing poems or doing unrelated work.\n"
                 "Return meta_help when the user is asking how the assistant works or what it can do in the current planning context.\n"
                 "Set should_keep_results true when there is enough current planning context that the assistant should keep showing the current event results while softly redirecting.\n"
+                "As a default rule: set should_keep_results true when latest_result_context contains non-empty results AND the intent is temporary_distraction, out_of_scope, or meta_help.\n"
+                "Set should_keep_results false when there are no current results and there is no meaningful planning state to preserve.\n"
                 "For temporary_distraction, out_of_scope, or meta_help, message must be a concise user-facing soft redirection that acknowledges the detour and guides the user back to the active planning task or pending booking.\n"
-                "Do not answer the off-topic request in full. Keep the redirect concise, supportive, and focused on the saved goal_state when available.\n"
+                "Do not answer the off-topic request in full. Do not produce poems, full jokes, long explanations, or unrelated outputs.\n"
+                "At most, give a brief acknowledgment (one short sentence) and then redirect back to the active planning goal.\n"
+                "Keep the redirect concise, supportive, and focused on the saved goal_state when available.\n"
                 "Do not invent filters or results."
             ),
             ("user", "{payload}"),
@@ -1038,9 +1055,15 @@ def _build_resolver_invocation_plan_chain():
                 "You decide which resolver families need to run for the current event-planning turn.\n"
                 "The user message is provided as JSON with user_message, current_filters, pending_booking, latest_result_context, and turn_policy_intent.\n"
                 "This planner also decides whether the turn is a soft redirect or whether the booking-selection agent should be tried first.\n"
+                "Always set search_domains explicitly. Use [] for pure soft-redirect turns that should not run search. Use ['movies'] for movie-only planning turns. Use ['sports'] for sports-only planning turns. Use ['movies','sports'] only when the user is explicitly exploring both.\n"
                 "Return intent temporary_distraction, out_of_scope, or meta_help only when the assistant should respond with a concise soft redirect instead of running normal search resolution.\n"
                 "When returning a soft redirect intent, set message to the user-facing redirect text and set should_keep_results appropriately.\n"
-                "Return should_try_booking_agent true only when there is no pending booking and the user is explicitly trying to book or pick one of the currently visible results.\n"
+                "If latest_result_context contains non-empty results and the user asks for something off-topic like a poem, joke, or unrelated task, prefer intent temporary_distraction with should_keep_results true and a short redirect message that keeps them on track.\n"
+                "Examples of off-topic: 'write a poem', 'tell me a joke', 'do my homework', 'summarize this PDF'.\n"
+                "Do not classify those as task_continue or search_change when there is existing planning context.\n"
+                "When producing a soft redirect message, do not comply with the off-topic request (no poem, no full joke). Use one short acknowledgment and then redirect back to planning.\n"
+                "Return should_try_booking_agent true only when there is no pending booking and the user is explicitly trying to book or pick one of the currently visible results, or when the user is providing a bare confirmation/rejection like 'yes'/'no' that appears to be about booking but there is no selection yet (so the booking agent can respond with 'choose an event first').\n"
+                "Examples that MUST set should_try_booking_agent true include: 'book the first one', 'book the second one', 'book this', 'reserve this', 'pick the Mumbai one', 'choose the Chennai match', 'पहला वाला बुक करो', 'दूसरा वाला बुक करो', and 'इसको बुक करो'.\n"
                 "For normal search or filter changes, keep should_try_booking_agent false.\n"
                 "Return booleans indicating only the resolver families needed for this turn.\n"
                 "Do not select unrelated resolver families.\n"
@@ -1052,7 +1075,7 @@ def _build_resolver_invocation_plan_chain():
                 "If the user expresses a specific movie-only or sports-only filter without naming the domain directly, include the matching domain resolver so the application can infer the domain from grounded resolver output.\n"
                 "Only enable sport catalog inquiry when the user is asking informational questions about available sports or alternatives.\n"
                 "Keep the plan grounded in the current thread context and turn_policy_intent.\n"
-                "When unsure, it is better to run an extra resolver than to miss a needed one.\n"
+                "When unsure, prefer the minimal set of resolvers needed for the user's explicit change to avoid accidental filter drift.\n"
                 "Return only the structured plan."
             ),
             ("user", "{payload}"),
@@ -1546,7 +1569,18 @@ def resolve_turn_filters(
                 filter_label="event type",
             )
 
-    effective_domains = updates.event_types or current_domains
+    if resolver_plan.search_domains:
+        planned_domains = list(resolver_plan.search_domains)
+        if planned_domains != list(current_domains):
+            updates = _merge_active_filters(updates, ActiveFilters(event_types=planned_domains))
+            clear_fields = _merge_clear_fields(clear_fields, ["event_types"])
+            domain_switched = bool(planned_domains and planned_domains != list(current_domains))
+
+    effective_domains = (
+        list(resolver_plan.search_domains)
+        if getattr(resolver_plan, "search_domains", None)
+        else (updates.event_types or current_domains)
+    )
 
     if not effective_domains and (resolver_plan.run_movie_filters or resolver_plan.run_sport_filters):
         if resolver_plan.run_movie_filters:
@@ -1615,11 +1649,7 @@ def resolve_turn_filters(
         )
 
     if "sports" in effective_domains:
-        if (
-            resolver_plan.run_sport_catalog_inquiry
-            and not domain_switched
-            and _should_run_sport_catalog_inquiry(user_message)
-        ):
+        if resolver_plan.run_sport_catalog_inquiry and not domain_switched:
             sport_catalog_inquiry = invoke_sport_catalog_inquiry(user_message)
             if sport_catalog_inquiry.status == "answer":
                 trace.append("resolve_sport_catalog_inquiry")
@@ -1705,8 +1735,11 @@ def _sanitize_explicit_entity_fields(
 
     sanitized_partial = ActiveFilters.model_validate(partial)
     has_filters = any(value not in (None, [], "") for value in sanitized_partial.model_dump().values())
+    next_status = resolution.status
+    if resolution.status == "resolved" and not has_filters:
+        next_status = "no_input"
     return FilterResolution(
-        status=resolution.status if has_filters else "no_input",
+        status=next_status,
         message=resolution.message,
         clear_fields=resolution.clear_fields,
         confidence=resolution.confidence,
