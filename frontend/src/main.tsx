@@ -7,7 +7,7 @@ import { BookingsPage } from './pages/bookings-page.tsx'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <BrowserRouter>
+    <BrowserRouter basename="/ai-agents/ticket-booking-agent">
       <Routes>
         <Route path="/t/:threadId" element={<App />} />
         <Route path="/bookings" element={<BookingsPage />} />
