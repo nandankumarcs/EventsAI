@@ -4,6 +4,7 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { ChatWorkspace } from '@/components/chat/chat-workspace'
 import { ThreadFiltersPanel } from '@/components/chat/thread-filters-panel'
 import { ThreadSidebar } from '@/components/chat/thread-sidebar'
+import { AppFooter } from '@/components/layout/app-footer'
 import {
   deleteThread,
   fetchHealth,
@@ -364,11 +365,11 @@ function App() {
 
   return (
     <div className="flex h-screen w-full flex-col overflow-hidden bg-background">
-      <div 
-        className="grid h-full min-h-0 flex-1 lg:grid-cols-[var(--sidebar-width)_minmax(0,1fr)] xl:grid-cols-[var(--sidebar-width)_minmax(0,1fr)_320px]"
+      <div
+        className="grid min-h-0 flex-1 overflow-hidden lg:grid-cols-[var(--sidebar-width)_minmax(0,1fr)] xl:grid-cols-[var(--sidebar-width)_minmax(0,1fr)_320px]"
         style={{ '--sidebar-width': `${sidebarWidth}px`, transition: isDraggingSidebar.current ? 'none' : 'grid-template-columns 0.1s ease-out' } as React.CSSProperties}
       >
-        <div className="relative flex h-full min-h-0">
+        <div className="relative flex min-h-0 overflow-hidden">
           <ThreadSidebar
             threads={threads}
             selectedThreadId={isNewChat ? null : (urlThreadId ?? null)}
@@ -393,7 +394,8 @@ function App() {
             <div className="h-8 w-1 rounded-full bg-border group-hover:bg-primary/50 transition-colors" />
           </div>
         </div>
-        <ChatWorkspace
+        <div className="min-h-0 overflow-auto">
+          <ChatWorkspace
           thread={selectedThread}
           draft={draft}
           sending={sending}
@@ -407,9 +409,14 @@ function App() {
           onCreateThread={handleCreateThread}
           onRetryHealth={bootstrapApp}
           onRetryAction={handleRetryAction}
-        />
-        <ThreadFiltersPanel thread={selectedThread} />
+          />
+        </div>
+        <div className="min-h-0 overflow-auto">
+          <ThreadFiltersPanel thread={selectedThread} />
+        </div>
       </div>
+
+      <AppFooter />
     </div>
   )
 }

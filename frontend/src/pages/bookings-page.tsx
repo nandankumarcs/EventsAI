@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
+  type ColumnDef,
   flexRender,
   getCoreRowModel,
   getPaginationRowModel,
@@ -12,6 +13,7 @@ import { ArrowUpDown, ChevronLeft, ChevronRight, Trash2, ArrowLeft } from 'lucid
 
 import { deleteBooking, listBookings, type BookingSummary } from '@/lib/api'
 import { Button } from '@/components/ui/button'
+import { AppFooter } from '@/components/layout/app-footer'
 
 export function BookingsPage() {
   const [data, setData] = useState<BookingSummary[]>([])
@@ -46,10 +48,10 @@ export function BookingsPage() {
     }
   }
 
-  const columns = [
+  const columns: ColumnDef<BookingSummary>[] = [
     {
       accessorKey: 'event_title',
-      header: ({ column }: any) => {
+      header: ({ column }) => {
         return (
           <Button
             variant="ghost"
@@ -65,8 +67,8 @@ export function BookingsPage() {
     {
       accessorKey: 'event_type',
       header: 'Type',
-      cell: ({ row }: any) => {
-        const type = row.getValue('event_type')
+      cell: ({ row }) => {
+        const type = String(row.getValue('event_type') ?? '')
         return (
           <span className="capitalize px-2 py-1 rounded-full text-xs font-medium bg-muted text-muted-foreground border border-border">
             {type}
@@ -77,8 +79,8 @@ export function BookingsPage() {
     {
       accessorKey: 'customer_name',
       header: 'Customer',
-      cell: ({ row }: any) => {
-        const name = row.getValue('customer_name') || 'N/A'
+      cell: ({ row }) => {
+        const name = String(row.getValue('customer_name') ?? '') || 'N/A'
         const email = row.original.customer_email || 'N/A'
         const contact = row.original.customer_contact_number || 'N/A'
         return (
@@ -92,7 +94,7 @@ export function BookingsPage() {
     },
     {
       id: 'actions',
-      cell: ({ row }: any) => {
+      cell: ({ row }) => {
         return (
           <Button
             variant="ghost"
@@ -132,7 +134,7 @@ export function BookingsPage() {
         </div>
       </header>
 
-      <main className="flex-1 overflow-auto p-6">
+      <main className="min-h-0 flex-1 overflow-auto p-6">
         <div className="max-w-6xl mx-auto w-full space-y-4">
           <div className="rounded-md border border-border bg-card">
             <div className="overflow-x-auto relative min-h-[400px]">
@@ -205,6 +207,8 @@ export function BookingsPage() {
           </div>
         </div>
       </main>
+
+      <AppFooter />
     </div>
   )
 }
