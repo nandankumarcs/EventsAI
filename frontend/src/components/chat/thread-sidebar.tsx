@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
-import { Plus, Trash2, Check, X, Ticket } from 'lucide-react'
+import { Link, useNavigate } from 'react-router-dom'
+import { Plus, Trash2, Check, X, Ticket, LogOut } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
-import type { ThreadSummary } from '@/lib/api'
+import { logout, type ThreadSummary } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
 type ThreadSidebarProps = {
@@ -34,6 +34,8 @@ export function ThreadSidebar({
 }: ThreadSidebarProps) {
   const sentinelRef = useRef<HTMLDivElement>(null)
   const [threadToDelete, setThreadToDelete] = useState<string | null>(null)
+  const [loggingOut, setLoggingOut] = useState(false)
+  const navigate = useNavigate()
 
   useEffect(() => {
     if (!sentinelRef.current || !hasMore || isLoadingMore) {
@@ -192,6 +194,27 @@ export function ThreadSidebar({
             </div>
           ) : null}
         </div>
+      </div>
+
+      <div className="p-3 border-t border-border/40">
+        <Button
+          type="button"
+          variant="ghost"
+          className="w-full justify-start gap-2 text-muted-foreground hover:bg-accent hover:text-foreground"
+          disabled={loggingOut}
+          onClick={async () => {
+            setLoggingOut(true)
+            try {
+              await logout()
+            } finally {
+              navigate('/login?next=%2F', { replace: true })
+              setLoggingOut(false)
+            }
+          }}
+        >
+          <LogOut className="size-4" />
+          {loggingOut ? 'Logging out…' : 'Logout'}
+        </Button>
       </div>
     </aside>
   )

@@ -200,16 +200,33 @@ const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ??
   'http://127.0.0.1:8000'
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  options?: { skipAuthRedirect?: boolean },
+): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     headers: {
       'Content-Type': 'application/json',
       ...(init?.headers ?? {}),
     },
+    credentials: 'include',
     ...init,
   })
 
   if (!response.ok) {
+    if (response.status === 401 && !options?.skipAuthRedirect) {
+      const basename = '/ai-agents/ticket-booking-agent'
+      const fullPath = window.location.pathname + window.location.search
+      const relativePath = fullPath.startsWith(basename)
+        ? fullPath.slice(basename.length)
+        : fullPath
+      
+      const next = encodeURIComponent(relativePath || '/')
+      window.location.assign(`${basename}/login?next=${next}`)
+      throw new Error('Authentication required')
+    }
+
     let detail = `Request failed with status ${response.status}`
 
     try {
@@ -225,6 +242,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   return (await response.json()) as T
+}
+
+export async function login(password: string) {
+  return request<{ success: boolean }>(
+    '/api/auth/login/',
+    {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+    },
+    { skipAuthRedirect: true },
+  )
+}
+
+export async function logout() {
+  return request<{ success: boolean }>('/api/auth/logout/', {
+    method: 'POST',
+  })
 }
 
 export async function fetchHealth() {
