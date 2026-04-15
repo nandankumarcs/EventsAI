@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from secrets import token_hex
 from typing import Any
 
-from django.utils import timezone
+from sqlalchemy import func, select
 
-from apps.bookings.models import Booking
-from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
-from apps.events.models import MovieEvent, SportEvent
+from flask_app.db import get_session
 from apps.events.services import search_movie_events, search_sport_events
+from flask_app.orm.models import Booking, ChatMessage, ChatThread, MovieEvent, SportEvent, ThreadFilter
 
 REQUIRED_BOOKING_USER_FIELDS = ("name", "email", "contact_number")
 FIELD_PROMPTS = {
@@ -29,6 +28,8 @@ def create_booking_from_listing(
     append_confirmation_message: bool = True,
 ) -> tuple[Booking, bool]:
     """Create a booking for the given thread and listing code, or return the existing one."""
+    session = get_session()
+    now = datetime.now(timezone.utc)
     event_type, event_obj, event_snapshot = resolve_event_by_listing_code(listing_code)
     if event_obj is None:
         raise BookingFlowError("No event found for the given listing_code", status_code=404)
@@ -37,7 +38,7 @@ def create_booking_from_listing(
     if existing_booking is not None:
         return existing_booking, True
 
-    if thread.status == ChatThread.Status.BOOKED:
+    if thread.status == "booked":
         raise BookingFlowError(
             "This thread already has a confirmed booking. Start a new thread to book another event.",
             status_code=409,
@@ -45,27 +46,33 @@ def create_booking_from_listing(
 
     customer_info = (thread_filter.pending_booking or {}).get("customer_info", {}) if thread_filter else {}
 
-    booking = Booking.objects.create(
-        thread=thread,
-        booking_reference=generate_booking_reference(),
-        event_type=event_type,
-        status=Booking.Status.CONFIRMED,
-        movie_event=event_obj if event_type == Booking.EventType.MOVIE else None,
-        sport_event=event_obj if event_type == Booking.EventType.SPORT else None,
-        event_title=event_snapshot["title"],
-        customer_name=customer_info.get("name", ""),
-        customer_email=customer_info.get("email", ""),
-        customer_contact_number=customer_info.get("contact_number", ""),
-        city=event_snapshot["city"],
-        venue_name=event_snapshot["venue_name"],
-        starts_at=parse_starts_at(event_snapshot["start_at"]),
-        filter_snapshot=(thread_filter.active_filters if thread_filter else {}),
-        event_snapshot=event_snapshot,
-        metadata={
-            "confirmed_via": confirmed_via,
-            "customer_info": customer_info,
-        },
-    )
+    with session.begin():
+        booking = Booking(
+            thread_id=thread.id,
+            booking_reference=generate_booking_reference(),
+            event_type=event_type,
+            status="confirmed",
+            movie_event_id=event_obj.id if event_type == "movie" else None,
+            sport_event_id=event_obj.id if event_type == "sport" else None,
+            event_title=event_snapshot["title"],
+            customer_name=customer_info.get("name", ""),
+            customer_email=customer_info.get("email", ""),
+            customer_contact_number=customer_info.get("contact_number", ""),
+            city=event_snapshot["city"],
+            venue_name=event_snapshot["venue_name"],
+            starts_at=parse_starts_at(event_snapshot["start_at"]),
+            confirmed_at=now,
+            filter_snapshot=(thread_filter.active_filters if thread_filter else {}),
+            event_snapshot=event_snapshot,
+            meta={
+                "confirmed_via": confirmed_via,
+                "customer_info": customer_info,
+            },
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(booking)
+        session.flush()
 
     if append_confirmation_message:
         confirmation_message = (
@@ -79,37 +86,50 @@ def create_booking_from_listing(
             listing_code=listing_code,
         )
     else:
-        thread.status = ChatThread.Status.BOOKED
-        thread.last_message_preview = booking.event_title[:500]
-        thread.last_activity_at = timezone.now()
-        thread.save(update_fields=["status", "last_message_preview", "last_activity_at", "updated_at"])
+        with session.begin():
+            locked_thread = session.execute(
+                select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+            ).scalar_one()
+            locked_thread.status = "booked"
+            locked_thread.last_message_preview = booking.event_title[:500]
+            locked_thread.last_activity_at = now
+            locked_thread.updated_at = now
 
     if thread_filter is not None:
-        thread_filter.pending_booking = {}
-        thread_filter.save(update_fields=["pending_booking", "updated_at"])
+        with session.begin():
+            locked_filter = session.execute(
+                select(ThreadFilter).where(ThreadFilter.id == thread_filter.id).with_for_update()
+            ).scalar_one()
+            locked_filter.pending_booking = {}
+            locked_filter.updated_at = now
 
     return booking, False
 
 
-def get_current_thread_result_context(*, thread_filter: ThreadFilter) -> dict[str, Any]:
-    return thread_filter.latest_result_context or {}
-
-
 def get_pending_thread_booking(*, thread_filter: ThreadFilter) -> dict[str, Any]:
-    return thread_filter.pending_booking or {}
+    """Return the current pending booking selection for the given thread filter."""
+    return dict(thread_filter.pending_booking or {}) if thread_filter else {}
 
 
 def get_thread_booking_context(*, thread_filter: ThreadFilter) -> dict[str, Any]:
+    """Return the current booking stage context, filters, and latest visible results for the thread."""
     pending_booking = get_pending_thread_booking(thread_filter=thread_filter)
     return {
         "active_filters": thread_filter.active_filters or {},
-        "latest_result_context": get_current_thread_result_context(thread_filter=thread_filter),
+        "latest_result_context": thread_filter.latest_result_context or {},
         "pending_booking": pending_booking,
         "missing_fields": get_missing_booking_user_fields(pending_booking.get("customer_info", {})),
     }
 
 
+def get_current_thread_result_context(*, thread_filter: ThreadFilter) -> dict[str, Any]:
+    """Return the current thread result context including filters and pending booking state."""
+    return get_thread_booking_context(thread_filter=thread_filter)
+
+
 def mark_thread_pending_booking(*, thread_filter: ThreadFilter, listing_code: str) -> dict[str, Any]:
+    session = get_session()
+    now = datetime.now(timezone.utc)
     context = get_current_thread_result_context(thread_filter=thread_filter)
     result_match = next(
         (result for result in context.get("results", []) if result.get("listing_code") == listing_code),
@@ -124,7 +144,7 @@ def mark_thread_pending_booking(*, thread_filter: ThreadFilter, listing_code: st
         "status": "pending_confirmation",
         "listing_code": listing_code,
         "event_snapshot": result_match,
-        "selected_at": timezone.now().isoformat(),
+        "selected_at": now.isoformat(),
         "awaiting_field": None,
         "customer_info": {
             "name": existing_customer_info.get("name", ""),
@@ -132,8 +152,12 @@ def mark_thread_pending_booking(*, thread_filter: ThreadFilter, listing_code: st
             "contact_number": existing_customer_info.get("contact_number", ""),
         },
     }
-    thread_filter.pending_booking = pending_booking
-    thread_filter.save(update_fields=["pending_booking", "updated_at"])
+    with session.begin():
+        locked_filter = session.execute(
+            select(ThreadFilter).where(ThreadFilter.id == thread_filter.id).with_for_update()
+        ).scalar_one()
+        locked_filter.pending_booking = pending_booking
+        locked_filter.updated_at = now
     return pending_booking
 
 
@@ -147,8 +171,14 @@ def select_thread_pending_booking(*, thread_filter: ThreadFilter, listing_code: 
 
 
 def clear_thread_pending_booking(*, thread_filter: ThreadFilter) -> dict[str, Any]:
-    thread_filter.pending_booking = {}
-    thread_filter.save(update_fields=["pending_booking", "updated_at"])
+    session = get_session()
+    now = datetime.now(timezone.utc)
+    with session.begin():
+        locked_filter = session.execute(
+            select(ThreadFilter).where(ThreadFilter.id == thread_filter.id).with_for_update()
+        ).scalar_one()
+        locked_filter.pending_booking = {}
+        locked_filter.updated_at = now
     return {}
 
 
@@ -202,8 +232,14 @@ def attempt_thread_pending_booking_confirmation(
             "status": "awaiting_user_info",
             "awaiting_field": next_field,
         }
-        thread_filter.pending_booking = updated_pending_booking
-        thread_filter.save(update_fields=["pending_booking", "updated_at"])
+        session = get_session()
+        now = datetime.now(timezone.utc)
+        with session.begin():
+            locked_filter = session.execute(
+                select(ThreadFilter).where(ThreadFilter.id == thread_filter.id).with_for_update()
+            ).scalar_one()
+            locked_filter.pending_booking = updated_pending_booking
+            locked_filter.updated_at = now
         return {
             "status": "missing_user_info",
             "next_required_field": next_field,
@@ -249,8 +285,14 @@ def save_thread_booking_user_info(*, thread_filter: ThreadFilter, field_name: st
         "customer_info": customer_info,
         "awaiting_field": None,
     }
-    thread_filter.pending_booking = updated_pending_booking
-    thread_filter.save(update_fields=["pending_booking", "updated_at"])
+    session = get_session()
+    now = datetime.now(timezone.utc)
+    with session.begin():
+        locked_filter = session.execute(
+            select(ThreadFilter).where(ThreadFilter.id == thread_filter.id).with_for_update()
+        ).scalar_one()
+        locked_filter.pending_booking = updated_pending_booking
+        locked_filter.updated_at = now
     return updated_pending_booking
 
 
@@ -285,23 +327,38 @@ def append_booking_confirmation_message(
     listing_code: str,
 ) -> None:
     """Update the thread to booked state and append a confirmation assistant message."""
-    thread.status = ChatThread.Status.BOOKED
-    thread.last_message_preview = confirmation_message[:500]
-    thread.last_activity_at = timezone.now()
-    thread.save(update_fields=["status", "last_message_preview", "last_activity_at", "updated_at"])
+    session = get_session()
+    now = datetime.now(timezone.utc)
+    with session.begin():
+        locked_thread = session.execute(
+            select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+        ).scalar_one()
+        locked_thread.status = "booked"
+        locked_thread.last_message_preview = confirmation_message[:500]
+        locked_thread.last_activity_at = now
+        locked_thread.updated_at = now
 
-    next_position = (thread.messages.order_by("-position").values_list("position", flat=True).first() or 0) + 1
-    ChatMessage.objects.create(
-        thread=thread,
-        position=next_position,
-        role=ChatMessage.Role.ASSISTANT,
-        content=confirmation_message,
-        metadata={
-            "booking_id": str(booking.id),
-            "booking_reference": booking.booking_reference,
-            "listing_code": listing_code,
-        },
-    )
+        next_position = (
+            session.execute(
+                select(func.coalesce(func.max(ChatMessage.position), 0)).where(ChatMessage.thread_id == locked_thread.id)
+            ).scalar_one()
+            + 1
+        )
+        message = ChatMessage(
+            thread_id=locked_thread.id,
+            position=next_position,
+            role="assistant",
+            content=confirmation_message,
+            tool_name="",
+            meta={
+                "booking_id": str(booking.id),
+                "booking_reference": booking.booking_reference,
+                "listing_code": listing_code,
+            },
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(message)
 
 
 def build_latest_result_context(
@@ -335,14 +392,20 @@ def build_latest_result_context(
 
     return {
         "thread_id": str(thread.id),
-        "captured_at": timezone.now().isoformat(),
+        "captured_at": datetime.now(timezone.utc).isoformat(),
         "search_domains": search_domains,
         "results": ordered_results,
     }
 
 
 def find_existing_booking(*, thread: ChatThread, listing_code: str) -> Booking | None:
-    for booking in thread.bookings.all().order_by("-confirmed_at"):
+    session = get_session()
+    bookings = session.execute(
+        select(Booking)
+        .where(Booking.thread_id == thread.id)
+        .order_by(Booking.confirmed_at.desc())
+    ).scalars().all()
+    for booking in bookings:
         event_snapshot = booking.event_snapshot or {}
         if event_snapshot.get("listing_code") == listing_code:
             return booking
@@ -350,15 +413,16 @@ def find_existing_booking(*, thread: ChatThread, listing_code: str) -> Booking |
 
 
 def resolve_event_by_listing_code(listing_code: str):
+    session = get_session()
     movie_result = search_movie_events({"listing_codes": [listing_code]}, limit=1, offset=0)
     if movie_result.results:
-        movie_event = MovieEvent.objects.get(listing_code=listing_code)
-        return Booking.EventType.MOVIE, movie_event, movie_result.results[0]
+        movie_event = session.execute(select(MovieEvent).where(MovieEvent.listing_code == listing_code)).scalar_one()
+        return "movie", movie_event, movie_result.results[0]
 
     sport_result = search_sport_events({"listing_codes": [listing_code]}, limit=1, offset=0)
     if sport_result.results:
-        sport_event = SportEvent.objects.get(listing_code=listing_code)
-        return Booking.EventType.SPORT, sport_event, sport_result.results[0]
+        sport_event = session.execute(select(SportEvent).where(SportEvent.listing_code == listing_code)).scalar_one()
+        return "sport", sport_event, sport_result.results[0]
 
     return None, None, None
 

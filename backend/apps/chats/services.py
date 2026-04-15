@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Literal
 
-from django.db import transaction
-from django.utils import timezone
+from sqlalchemy import select
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
 
 from apps.agents.langchain_tools import get_chat_model
 from apps.agents.services import ChatTurnError, process_chat_turn
-from apps.chats.models import ChatThread, ThreadFilter
+from flask_app.db import get_session
 from apps.flights.chat_services import process_flight_chat_turn
+from flask_app.orm.models import ChatThread, ThreadFilter
 
 
 class ThreadModeDecision(BaseModel):
@@ -20,24 +21,37 @@ class ThreadModeDecision(BaseModel):
 
 
 def process_unified_chat_turn(*, user_message: str, thread_id: str | None = None) -> dict[str, Any]:
-    thread = _get_or_create_thread(thread_id=thread_id)
+    # Phase 1: Get/create thread and determine mode
+    session = get_session()
+    thread = _get_or_create_thread_nested(thread_id=thread_id, session=session)
     _assert_thread_accepts_messages(thread)
 
     decision = invoke_thread_mode_decision(user_message=user_message, thread=thread)
-    _maybe_switch_thread_mode(thread=thread, decision=decision)
+    _maybe_switch_thread_mode(thread=thread, decision=decision, session=session)
 
-    if thread.mode == ChatThread.Mode.FLIGHTS:
-        return process_flight_chat_turn(user_message=user_message, thread_id=str(thread.id))
-    return process_chat_turn(user_message=user_message, thread_id=str(thread.id))
+    # Re-fetch thread after potential mode switch
+    thread = session.execute(
+        select(ChatThread).where(ChatThread.id == thread.id)
+    ).scalar_one()
+    current_mode = thread.mode
+    current_thread_id = str(thread.id)
+
+    # Phase 2: Route to appropriate handler
+    if current_mode == "flights":
+        return process_flight_chat_turn(user_message=user_message, thread_id=current_thread_id)
+    return process_chat_turn(user_message=user_message, thread_id=current_thread_id)
 
 
-def _maybe_switch_thread_mode(*, thread: ChatThread, decision: ThreadModeDecision) -> None:
-    desired_mode = ChatThread.Mode.FLIGHTS if decision.mode == "flights" else ChatThread.Mode.ENTERTAINMENT
-    if thread.mode == ChatThread.Mode.UNKNOWN:
-        with transaction.atomic():
-            thread.refresh_from_db(fields=["mode", "updated_at"])
-            thread.mode = desired_mode
-            thread.save(update_fields=["mode", "updated_at"])
+def _maybe_switch_thread_mode(*, thread: ChatThread, decision: ThreadModeDecision, session) -> None:
+    desired_mode = "flights" if decision.mode == "flights" else "entertainment"
+    now = datetime.now(timezone.utc)
+
+    if thread.mode == "unknown":
+        locked_thread = session.execute(
+            select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+        ).scalar_one()
+        locked_thread.mode = desired_mode
+        locked_thread.updated_at = now
         return
 
     if thread.mode == desired_mode:
@@ -47,28 +61,23 @@ def _maybe_switch_thread_mode(*, thread: ChatThread, decision: ThreadModeDecisio
     if confidence < 0.75:
         return
 
-    with transaction.atomic():
-        thread.refresh_from_db()
-        thread_filter = ThreadFilter.objects.select_for_update().get(thread=thread)
-        thread.mode = desired_mode
-        thread.save(update_fields=["mode", "updated_at"])
-        thread_filter.active_filters = {}
-        thread_filter.latest_result_context = {}
-        thread_filter.pending_booking = {}
-        thread_filter.resolver_trace = ["mode_switch"]
-        thread_filter.version += 1
-        thread_filter.last_resolved_at = timezone.now()
-        thread_filter.save(
-            update_fields=[
-                "active_filters",
-                "latest_result_context",
-                "pending_booking",
-                "resolver_trace",
-                "version",
-                "last_resolved_at",
-                "updated_at",
-            ]
-        )
+    locked_thread = session.execute(
+        select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+    ).scalar_one()
+    thread_filter = session.execute(
+        select(ThreadFilter).where(ThreadFilter.thread_id == locked_thread.id).with_for_update()
+    ).scalar_one()
+
+    locked_thread.mode = desired_mode
+    locked_thread.updated_at = now
+
+    thread_filter.active_filters = {}
+    thread_filter.latest_result_context = {}
+    thread_filter.pending_booking = {}
+    thread_filter.resolver_trace = ["mode_switch"]
+    thread_filter.version = int(thread_filter.version or 0) + 1
+    thread_filter.last_resolved_at = now
+    thread_filter.updated_at = now
 
 
 def invoke_thread_mode_decision(*, user_message: str, thread: ChatThread) -> ThreadModeDecision:
@@ -102,31 +111,92 @@ def invoke_thread_mode_decision(*, user_message: str, thread: ChatThread) -> Thr
     )
 
 
-def _get_or_create_thread(*, thread_id: str | None) -> ChatThread:
-    if thread_id:
-        thread = (
-            ChatThread.objects.exclude(status=ChatThread.Status.DELETED)
-            .select_related("filter_state")
-            .filter(id=thread_id)
-            .first()
-        )
-        if thread is None:
-            raise ChatTurnError("Thread not found", status_code=404)
-        return thread
+def _get_thread_by_id(*, thread_id: str, session) -> ChatThread:
+    from uuid import UUID
+    thread_uuid = UUID(thread_id) if isinstance(thread_id, str) else thread_id
+    thread = session.execute(
+        select(ChatThread).where(ChatThread.id == thread_uuid).where(ChatThread.status != "deleted")
+    ).scalar_one_or_none()
+    if thread is None:
+        raise ChatTurnError("Thread not found", status_code=404)
+    return thread
 
-    with transaction.atomic():
-        thread = ChatThread.objects.create(
+
+def _get_or_create_thread(*, thread_id: str | None, session=None) -> ChatThread:
+    from uuid import UUID
+    if session is None:
+        session = get_session()
+    now = datetime.now(timezone.utc)
+    if thread_id:
+        return _get_thread_by_id(thread_id=thread_id, session=session)
+
+    with session.begin():
+        thread = ChatThread(
             title="New thread",
-            mode=ChatThread.Mode.UNKNOWN,
+            summary="",
+            mode="unknown",
+            status="active",
             last_message_preview="",
-            last_activity_at=timezone.now(),
+            last_activity_at=now,
+            meta={},
+            created_at=now,
+            updated_at=now,
         )
-        ThreadFilter.objects.get_or_create(thread=thread)
-        return thread
+        session.add(thread)
+        session.flush()
+        thread_filter = ThreadFilter(
+            thread_id=thread.id,
+            active_filters={},
+            latest_result_context={},
+            pending_booking={},
+            resolver_trace=[],
+            version=1,
+            last_resolved_at=None,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(thread_filter)
+    return thread
+
+
+def _get_or_create_thread_nested(*, thread_id: str | None, session) -> ChatThread:
+    """Version for use inside an existing transaction - does not call session.begin()."""
+    from uuid import UUID
+    now = datetime.now(timezone.utc)
+    if thread_id:
+        return _get_thread_by_id(thread_id=thread_id, session=session)
+
+    # Already inside transaction, don't call session.begin()
+    thread = ChatThread(
+        title="New thread",
+        summary="",
+        mode="unknown",
+        status="active",
+        last_message_preview="",
+        last_activity_at=now,
+        meta={},
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(thread)
+    session.flush()
+    thread_filter = ThreadFilter(
+        thread_id=thread.id,
+        active_filters={},
+        latest_result_context={},
+        pending_booking={},
+        resolver_trace=[],
+        version=1,
+        last_resolved_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(thread_filter)
+    return thread
 
 
 def _assert_thread_accepts_messages(thread: ChatThread) -> None:
-    if thread.status == ChatThread.Status.ARCHIVED:
+    if thread.status == "archived":
         raise ChatTurnError("This thread is archived and cannot accept new messages.", status_code=409)
-    if thread.status == ChatThread.Status.DELETED:
+    if thread.status == "deleted":
         raise ChatTurnError("This thread has been deleted.", status_code=409)

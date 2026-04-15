@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
-from django.db import transaction
-from django.db.models import Max
-from django.utils import timezone
+from sqlalchemy import func, select
 
 from apps.agents.services import ChatTurnError
-from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
+from flask_app.db import get_session
+from flask_app.orm.models import ChatMessage, ChatThread, ThreadFilter
 from apps.flights.booking_services import (
     attempt_thread_pending_flight_booking_confirmation,
     capture_thread_flight_booking_user_info,
@@ -22,23 +22,24 @@ from apps.flights.services import search_flight_offers
 
 
 def process_flight_chat_turn(*, user_message: str, thread_id: str) -> dict[str, Any]:
-    reference_date = timezone.localdate().isoformat()
-    thread = (
-        ChatThread.objects.exclude(status=ChatThread.Status.DELETED)
-        .select_related("filter_state")
-        .filter(id=thread_id)
-        .first()
-    )
+    from uuid import UUID
+    reference_date = datetime.now(timezone.utc).date().isoformat()
+    session = get_session()
+    now = datetime.now(timezone.utc)
+    thread_uuid = UUID(thread_id) if isinstance(thread_id, str) else thread_id
+    thread = session.execute(
+        select(ChatThread).where(ChatThread.id == thread_uuid).where(ChatThread.status != "deleted")
+    ).scalar_one_or_none()
     if thread is None:
         raise ChatTurnError("Thread not found", status_code=404)
     _assert_thread_accepts_messages(thread)
 
-    with transaction.atomic():
+    with session.begin():
         thread_filter = _get_or_create_thread_filter(thread, lock=True)
         current_filters = FlightFilters.model_validate(thread_filter.active_filters or {})
         pending_booking_snapshot = dict(thread_filter.pending_booking or {})
         latest_result_context_snapshot = dict(thread_filter.latest_result_context or {})
-        _append_message(thread, role=ChatMessage.Role.USER, content=user_message, metadata={})
+        _append_message(thread, role="user", content=user_message, meta={})
 
     booking_resolution = FlightBookingTurnResolution(action="none")
     if pending_booking_snapshot.get("listing_code") or latest_result_context_snapshot.get("results"):
@@ -50,8 +51,10 @@ def process_flight_chat_turn(*, user_message: str, thread_id: str) -> dict[str, 
         )
 
     if booking_resolution.action != "none":
-        with transaction.atomic():
-            thread.refresh_from_db()
+        with session.begin():
+            thread = session.execute(
+                select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+            ).scalar_one()
             _assert_thread_accepts_messages(thread)
             thread_filter = _get_or_create_thread_filter(thread, lock=True)
             return _process_booking_resolution(
@@ -62,8 +65,10 @@ def process_flight_chat_turn(*, user_message: str, thread_id: str) -> dict[str, 
             )
 
     if get_pending_flight_booking(thread_filter=_get_or_create_thread_filter(thread, lock=False)).get("listing_code"):
-        with transaction.atomic():
-            thread.refresh_from_db()
+        with session.begin():
+            thread = session.execute(
+                select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+            ).scalar_one()
             _assert_thread_accepts_messages(thread)
             thread_filter = _get_or_create_thread_filter(thread, lock=True)
             return _build_pending_soft_redirect_payload(
@@ -112,11 +117,13 @@ def process_flight_chat_turn(*, user_message: str, thread_id: str) -> dict[str, 
             needs_clarification = False
             clarification_question = None
 
-    with transaction.atomic():
-        thread.refresh_from_db()
+    with session.begin():
+        thread = session.execute(
+            select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+        ).scalar_one()
         _assert_thread_accepts_messages(thread)
         thread_filter = _get_or_create_thread_filter(thread, lock=True)
-        thread.mode = ChatThread.Mode.FLIGHTS
+        thread.mode = "flights"
         thread_filter.active_filters = _compact_filter_state(merged_filters.model_dump(exclude_none=True))
         thread_filter.latest_result_context = _build_latest_flight_result_context(
             thread=thread,
@@ -125,23 +132,14 @@ def process_flight_chat_turn(*, user_message: str, thread_id: str) -> dict[str, 
         thread_filter.pending_booking = {}
         thread_filter.resolver_trace = ["resolve_flight_turn_filters"]
         thread_filter.version += 1
-        thread_filter.last_resolved_at = timezone.now()
-        thread_filter.save(
-            update_fields=[
-                "active_filters",
-                "latest_result_context",
-                "pending_booking",
-                "resolver_trace",
-                "version",
-                "last_resolved_at",
-                "updated_at",
-            ]
-        )
+        thread_filter.last_resolved_at = now
+        thread_filter.updated_at = now
+        session.flush()
         assistant_message = _append_message(
             thread,
-            role=ChatMessage.Role.ASSISTANT,
+            role="assistant",
             content=assistant_content,
-            metadata={
+            meta={
                 "needs_clarification": needs_clarification,
                 "clarification_question": clarification_question,
                 "search_domains": search_domains,
@@ -152,8 +150,7 @@ def process_flight_chat_turn(*, user_message: str, thread_id: str) -> dict[str, 
             },
         )
         thread.last_message_preview = assistant_content[:500]
-        thread.last_activity_at = timezone.now()
-        thread.save(update_fields=["mode", "last_message_preview", "last_activity_at", "updated_at"])
+        thread.last_activity_at = now
 
     return {
         "thread": {
@@ -233,7 +230,8 @@ def _process_booking_resolution(
                 thread=thread,
                 results_by_domain=results_by_domain,
             )
-            thread_filter.save(update_fields=["latest_result_context", "updated_at"])
+            thread_filter.updated_at = datetime.now(timezone.utc)
+            session.flush()
             if search_result.count:
                 assistant_content = (
                     assistant_content
@@ -315,17 +313,20 @@ def _process_booking_resolution(
     if not selected_offer_snapshot:
         selected_offer_snapshot = pending_booking_state.get("event_snapshot", {})
 
-    thread.mode = ChatThread.Mode.FLIGHTS
+    session = get_session()
+    now = datetime.now(timezone.utc)
+    thread.mode = "flights"
     thread_filter.resolver_trace = ["resolve_flight_booking_turn"]
     thread_filter.version += 1
-    thread_filter.last_resolved_at = timezone.now()
-    thread_filter.save(update_fields=["resolver_trace", "version", "last_resolved_at", "updated_at"])
+    thread_filter.last_resolved_at = now
+    thread_filter.updated_at = now
+    session.flush()
 
     assistant_message = _append_message(
         thread,
-        role=ChatMessage.Role.ASSISTANT,
+        role="assistant",
         content=assistant_content,
-        metadata={
+        meta={
             "booking_action": booking_action,
             "listing_code": pending_booking_state.get("listing_code", booking_resolution.listing_code),
             "requested_field": pending_booking_state.get("awaiting_field")
@@ -345,16 +346,9 @@ def _process_booking_resolution(
     )
 
     thread.last_message_preview = assistant_content[:500]
-    thread.last_activity_at = timezone.now()
-    thread.save(
-        update_fields=[
-            "mode",
-            "status",
-            "last_message_preview",
-            "last_activity_at",
-            "updated_at",
-        ]
-    )
+    thread.last_activity_at = now
+    thread.updated_at = now
+    session.flush()
 
     return {
         "thread": {
@@ -390,17 +384,20 @@ def _build_pending_soft_redirect_payload(
     thread_filter: ThreadFilter,
     assistant_content: str,
 ) -> dict[str, Any]:
-    thread.mode = ChatThread.Mode.FLIGHTS
+    session = get_session()
+    now = datetime.now(timezone.utc)
+    thread.mode = "flights"
     thread_filter.resolver_trace = ["resolve_flight_booking_turn"]
     thread_filter.version += 1
-    thread_filter.last_resolved_at = timezone.now()
-    thread_filter.save(update_fields=["resolver_trace", "version", "last_resolved_at", "updated_at"])
+    thread_filter.last_resolved_at = now
+    thread_filter.updated_at = now
+    session.flush()
 
     assistant_message = _append_message(
         thread,
-        role=ChatMessage.Role.ASSISTANT,
+        role="assistant",
         content=assistant_content,
-        metadata={
+        meta={
             "booking_action": "none",
             "selected_event": (thread_filter.pending_booking or {}).get("event_snapshot", {}),
             "pending_booking": thread_filter.pending_booking,
@@ -413,8 +410,9 @@ def _build_pending_soft_redirect_payload(
         },
     )
     thread.last_message_preview = assistant_content[:500]
-    thread.last_activity_at = timezone.now()
-    thread.save(update_fields=["mode", "last_message_preview", "last_activity_at", "updated_at"])
+    thread.last_activity_at = now
+    thread.updated_at = now
+    session.flush()
 
     return {
         "thread": {
@@ -431,7 +429,7 @@ def _build_pending_soft_redirect_payload(
             "position": assistant_message.position,
             "role": assistant_message.role,
             "content": assistant_message.content,
-            "metadata": assistant_message.metadata,
+            "metadata": assistant_message.meta,
             "created_at": assistant_message.created_at.isoformat(),
         },
         "active_filters": thread_filter.active_filters,
@@ -445,15 +443,23 @@ def _build_pending_soft_redirect_payload(
 
 
 def _get_or_create_thread_filter(thread: ChatThread, *, lock: bool) -> ThreadFilter:
-    queryset = ThreadFilter.objects.select_for_update() if lock else ThreadFilter.objects
-    thread_filter = queryset.filter(thread=thread).first()
+    session = get_session()
+    stmt = select(ThreadFilter).where(ThreadFilter.thread_id == thread.id)
+    if lock:
+        stmt = stmt.with_for_update()
+    thread_filter = session.execute(stmt).scalar_one_or_none()
     if thread_filter is None:
-        thread_filter = ThreadFilter.objects.create(thread=thread)
+        thread_filter = ThreadFilter(thread_id=thread.id)
+        session.add(thread_filter)
+        session.flush()
     return thread_filter
 
 
 def _next_message_position(thread: ChatThread) -> int:
-    max_position = thread.messages.aggregate(max_position=Max("position"))["max_position"] or 0
+    session = get_session()
+    max_position = session.execute(
+        select(func.coalesce(func.max(ChatMessage.position), 0)).where(ChatMessage.thread_id == thread.id)
+    ).scalar()
     return max_position + 1
 
 
@@ -462,21 +468,28 @@ def _append_message(
     *,
     role: str,
     content: str,
-    metadata: dict[str, Any],
+    meta: dict[str, Any],
 ) -> ChatMessage:
-    return ChatMessage.objects.create(
-        thread=thread,
+    session = get_session()
+    now = datetime.now(timezone.utc)
+    message = ChatMessage(
+        thread_id=thread.id,
         position=_next_message_position(thread),
         role=role,
         content=content,
-        metadata=metadata,
+        meta=meta,
+        created_at=now,
+        updated_at=now,
     )
+    session.add(message)
+    session.flush()
+    return message
 
 
 def _assert_thread_accepts_messages(thread: ChatThread) -> None:
-    if thread.status == ChatThread.Status.ARCHIVED:
+    if thread.status == "archived":
         raise ChatTurnError("This thread is archived and cannot accept new messages.", status_code=409)
-    if thread.status == ChatThread.Status.DELETED:
+    if thread.status == "deleted":
         raise ChatTurnError("This thread has been deleted.", status_code=409)
 
 
@@ -534,7 +547,7 @@ def _build_latest_flight_result_context(*, thread: ChatThread, results_by_domain
         )
     return {
         "thread_id": str(thread.id),
-        "captured_at": timezone.now().isoformat(),
+        "captured_at": datetime.now(timezone.utc).isoformat(),
         "search_domains": ["flights"] if raw_results else [],
         "results": results,
     }

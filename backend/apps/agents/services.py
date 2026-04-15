@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import os
+from datetime import datetime, timezone
 from typing import Any
 from types import SimpleNamespace
 
-from django.db import transaction
-from django.db.models import Max
-from django.utils import timezone
+from sqlalchemy import func, select
 
 from apps.agents.langchain_tools import (
     ResolutionIssue,
@@ -22,8 +22,9 @@ from apps.bookings.services import (
     get_missing_booking_user_fields,
     select_thread_pending_booking,
 )
-from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
+from flask_app.db import get_session
 from apps.events.services import diversify_sport_results, search_movie_events, search_sport_events
+from flask_app.orm.models import ChatMessage, ChatThread, ThreadFilter
 
 MOVIE_FILTER_KEYS = {
     "titles",
@@ -67,21 +68,22 @@ class ChatTurnError(Exception):
 
 
 def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dict[str, Any]:
-    reference_date = timezone.localdate().isoformat()
+    reference_date = datetime.now(timezone.utc).date().isoformat()
     thread, _created = _get_or_create_thread(user_message=user_message, thread_id=thread_id)
+    session = get_session()
+    now = datetime.now(timezone.utc)
 
-    with transaction.atomic():
-        _assert_thread_accepts_messages(thread)
-        thread_filter = _get_or_create_thread_filter(thread, lock=True)
-        current_filters = ActiveFilters.model_validate(thread_filter.active_filters or {})
-        pending_booking_before_turn = dict(thread_filter.pending_booking or {})
-        existing_goal_state = _get_thread_goal_state(thread)
-        has_pending_booking = bool((thread_filter.pending_booking or {}).get("listing_code"))
+    _assert_thread_accepts_messages(thread)
+    thread_filter = _get_or_create_thread_filter(thread, lock=True)
+    current_filters = ActiveFilters.model_validate(thread_filter.active_filters or {})
+    pending_booking_before_turn = dict(thread_filter.pending_booking or {})
+    existing_goal_state = _get_thread_goal_state(thread)
+    has_pending_booking = bool((thread_filter.pending_booking or {}).get("listing_code"))
 
-        _append_message(thread, role=ChatMessage.Role.USER, content=user_message, metadata={})
+    _append_message(thread, role="user", content=user_message, meta={})
 
-        pending_booking_snapshot = dict(thread_filter.pending_booking or {})
-        latest_result_context_snapshot = dict(thread_filter.latest_result_context or {})
+    pending_booking_snapshot = dict(thread_filter.pending_booking or {})
+    latest_result_context_snapshot = dict(thread_filter.latest_result_context or {})
 
     resolver_plan = None
     if has_pending_booking:
@@ -93,18 +95,19 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
             goal_state=existing_goal_state,
         )
         if turn_policy.intent in {"temporary_distraction", "out_of_scope", "meta_help"}:
-            with transaction.atomic():
-                thread.refresh_from_db()
-                _assert_thread_accepts_messages(thread)
-                thread_filter = _get_or_create_thread_filter(thread, lock=True)
-                return _process_soft_redirect_turn(
-                    thread=thread,
-                    thread_filter=thread_filter,
-                    current_filters=current_filters,
-                    turn_policy=turn_policy,
-                    user_message=user_message,
-                    existing_goal_state=existing_goal_state,
-                )
+            thread = session.execute(
+                select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+            ).scalar_one()
+            _assert_thread_accepts_messages(thread)
+            thread_filter = _get_or_create_thread_filter(thread, lock=True)
+            return _process_soft_redirect_turn(
+                thread=thread,
+                thread_filter=thread_filter,
+                current_filters=current_filters,
+                turn_policy=turn_policy,
+                user_message=user_message,
+                existing_goal_state=existing_goal_state,
+            )
     else:
         from apps.agents.langchain_tools import invoke_resolver_invocation_plan
 
@@ -121,18 +124,19 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
             should_keep_results=resolver_plan.should_keep_results,
         )
         if turn_policy.intent in {"temporary_distraction", "out_of_scope", "meta_help"}:
-            with transaction.atomic():
-                thread.refresh_from_db()
-                _assert_thread_accepts_messages(thread)
-                thread_filter = _get_or_create_thread_filter(thread, lock=True)
-                return _process_soft_redirect_turn(
-                    thread=thread,
-                    thread_filter=thread_filter,
-                    current_filters=current_filters,
-                    turn_policy=turn_policy,
-                    user_message=user_message,
-                    existing_goal_state=existing_goal_state,
-                )
+            thread = session.execute(
+                select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+            ).scalar_one()
+            _assert_thread_accepts_messages(thread)
+            thread_filter = _get_or_create_thread_filter(thread, lock=True)
+            return _process_soft_redirect_turn(
+                thread=thread,
+                thread_filter=thread_filter,
+                current_filters=current_filters,
+                turn_policy=turn_policy,
+                user_message=user_message,
+                existing_goal_state=existing_goal_state,
+            )
 
     booking_resolution = BookingTurnResolution(action="none")
     if has_pending_booking and turn_policy.intent in {"task_continue", "booking_change", "follow_up_about_results"}:
@@ -144,88 +148,89 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
         booking_resolution = BookingTurnResolution(action="none")
 
     if booking_resolution.action != "none":
-        with transaction.atomic():
-            thread.refresh_from_db()
-            if thread.status == ChatThread.Status.ARCHIVED:
-                raise ChatTurnError(
-                    "This thread is archived and cannot accept new messages.",
-                    status_code=409,
-                )
-            thread_filter = _get_or_create_thread_filter(thread, lock=True)
-
-            booking_resolution = _reconcile_booking_resolution(
-                user_message=user_message,
-                booking_resolution=booking_resolution,
-                thread_filter=thread_filter,
-                pending_booking_before_turn=pending_booking_before_turn,
-                current_filters=current_filters,
-                reference_date=reference_date,
+        thread = session.execute(
+            select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+        ).scalar_one()
+        if thread.status == "archived":
+            raise ChatTurnError(
+                "This thread is archived and cannot accept new messages.",
+                status_code=409,
             )
+        thread_filter = _get_or_create_thread_filter(thread, lock=True)
 
-            show_booking_results = booking_resolution.action == "booking_cleared"
-            booking_results_by_domain = (
-                _results_by_domain_from_latest_context(thread_filter.latest_result_context)
-                if show_booking_results
-                else {}
-            )
-            booking_search_domains = (
-                list((thread_filter.latest_result_context or {}).get("search_domains", []))
-                if show_booking_results
-                else []
-            )
+        booking_resolution = _reconcile_booking_resolution(
+            user_message=user_message,
+            booking_resolution=booking_resolution,
+            thread_filter=thread_filter,
+            pending_booking_before_turn=pending_booking_before_turn,
+            current_filters=current_filters,
+            reference_date=reference_date,
+        )
 
-            needs_clarification = booking_resolution.action in {"ambiguous", "no_match"}
-            clarification_question = booking_resolution.message if needs_clarification else None
-            goal_state = invoke_goal_state(
-                user_message=user_message,
-                assistant_message=booking_resolution.message,
-                active_filters=thread_filter.active_filters or {},
-                latest_result_context=thread_filter.latest_result_context,
-                pending_booking=thread_filter.pending_booking,
-                search_domains=booking_search_domains,
-                needs_clarification=needs_clarification,
-                clarification_question=clarification_question,
-                booking_action=booking_resolution.action,
-                turn_policy_intent=turn_policy.intent,
-                existing_goal_state=existing_goal_state,
-            )
-            _persist_thread_goal_state(thread, goal_state.model_dump())
-            assistant_message = _append_message(
-                thread,
-                role=ChatMessage.Role.ASSISTANT,
-                content=booking_resolution.message,
-                metadata={
-                    "booking_action": booking_resolution.action,
-                    "listing_code": booking_resolution.listing_code,
-                    "requested_field": booking_resolution.requested_field,
-                    "selected_event": booking_resolution.selected_event.model_dump(exclude_none=True, exclude_defaults=True)
-                    or thread_filter.pending_booking.get("event_snapshot", {}),
-                    "pending_booking": thread_filter.pending_booking,
-                    "booking": booking_resolution.booking.model_dump(exclude_none=True, exclude_defaults=True),
-                    "candidates": booking_resolution.candidates,
-                    "results_by_domain": booking_results_by_domain,
-                    "latest_result_context": thread_filter.latest_result_context,
-                    "goal_state": goal_state.model_dump(),
-                },
-            )
-            thread.last_message_preview = booking_resolution.message[:500]
-            thread.last_activity_at = timezone.now()
-            thread.save(update_fields=["last_message_preview", "last_activity_at", "updated_at", "metadata"])
+        show_booking_results = booking_resolution.action == "booking_cleared"
+        booking_results_by_domain = (
+            _results_by_domain_from_latest_context(thread_filter.latest_result_context)
+            if show_booking_results
+            else {}
+        )
+        booking_search_domains = (
+            list((thread_filter.latest_result_context or {}).get("search_domains", []))
+            if show_booking_results
+            else []
+        )
 
-            _update_dynamic_thread_title(thread)
-
-            return {
-                "thread": _serialize_thread(thread),
-                "assistant_message": _serialize_message(assistant_message),
-                "active_filters": thread_filter.active_filters,
-                "latest_result_context": thread_filter.latest_result_context,
+        needs_clarification = booking_resolution.action in {"ambiguous", "no_match"}
+        clarification_question = booking_resolution.message if needs_clarification else None
+        goal_state = invoke_goal_state(
+            user_message=user_message,
+            assistant_message=booking_resolution.message,
+            active_filters=thread_filter.active_filters or {},
+            latest_result_context=thread_filter.latest_result_context,
+            pending_booking=thread_filter.pending_booking,
+            search_domains=booking_search_domains,
+            needs_clarification=needs_clarification,
+            clarification_question=clarification_question,
+            booking_action=booking_resolution.action,
+            turn_policy_intent=turn_policy.intent,
+            existing_goal_state=existing_goal_state,
+        )
+        _persist_thread_goal_state(thread, goal_state.model_dump())
+        assistant_message = _append_message(
+            thread,
+            role="assistant",
+            content=booking_resolution.message,
+            meta={
+                "booking_action": booking_resolution.action,
+                "listing_code": booking_resolution.listing_code,
+                "requested_field": booking_resolution.requested_field,
+                "selected_event": booking_resolution.selected_event.model_dump(exclude_none=True, exclude_defaults=True)
+                or thread_filter.pending_booking.get("event_snapshot", {}),
                 "pending_booking": thread_filter.pending_booking,
-                "search_domains": booking_search_domains,
+                "booking": booking_resolution.booking.model_dump(exclude_none=True, exclude_defaults=True),
+                "candidates": booking_resolution.candidates,
                 "results_by_domain": booking_results_by_domain,
-                "needs_clarification": needs_clarification,
-                "clarification_question": clarification_question,
+                "latest_result_context": thread_filter.latest_result_context,
                 "goal_state": goal_state.model_dump(),
-            }
+            },
+        )
+        thread.last_message_preview = booking_resolution.message[:500]
+        thread.last_activity_at = now
+        thread.updated_at = now
+
+        _update_dynamic_thread_title(thread)
+
+        return {
+            "thread": _serialize_thread(thread),
+            "assistant_message": _serialize_message(assistant_message),
+            "active_filters": thread_filter.active_filters,
+            "latest_result_context": thread_filter.latest_result_context,
+            "pending_booking": thread_filter.pending_booking,
+            "search_domains": booking_search_domains,
+            "results_by_domain": booking_results_by_domain,
+            "needs_clarification": needs_clarification,
+            "clarification_question": clarification_question,
+            "goal_state": goal_state.model_dump(),
+        }
 
     turn_resolution = resolve_turn_filters(
         current_filters=current_filters,
@@ -281,32 +286,23 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
                     issue=ambiguity_issue,
                 )
 
-    with transaction.atomic():
-        thread.refresh_from_db()
-        _assert_thread_accepts_messages(thread)
-        thread_filter = _get_or_create_thread_filter(thread, lock=True)
+    thread = session.execute(
+        select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+    ).scalar_one()
+    _assert_thread_accepts_messages(thread)
+    thread_filter = _get_or_create_thread_filter(thread, lock=True)
 
-        thread_filter.active_filters = _compact_filter_state(merged_filters.model_dump())
-        thread_filter.latest_result_context = build_latest_result_context(
-            thread=thread,
-            search_domains=search_domains,
-            results_by_domain=results_by_domain,
-        )
-        thread_filter.pending_booking = {}
-        thread_filter.resolver_trace = turn_resolution.tool_trace
-        thread_filter.version += 1
-        thread_filter.last_resolved_at = timezone.now()
-        thread_filter.save(
-            update_fields=[
-                "active_filters",
-                "latest_result_context",
-                "pending_booking",
-                "resolver_trace",
-                "version",
-                "last_resolved_at",
-                "updated_at",
-            ]
-        )
+    thread_filter.active_filters = _compact_filter_state(merged_filters.model_dump())
+    thread_filter.latest_result_context = build_latest_result_context(
+        thread=thread,
+        search_domains=search_domains,
+        results_by_domain=results_by_domain,
+    )
+    thread_filter.pending_booking = {}
+    thread_filter.resolver_trace = turn_resolution.tool_trace
+    thread_filter.version += 1
+    thread_filter.last_resolved_at = now
+    thread_filter.updated_at = now
 
     assistant_metadata = {
         "needs_clarification": needs_clarification,
@@ -343,26 +339,27 @@ def process_chat_turn(*, user_message: str, thread_id: str | None = None) -> dic
     )
     assistant_metadata["goal_state"] = goal_state.model_dump()
 
-    with transaction.atomic():
-        thread.refresh_from_db()
-        _assert_thread_accepts_messages(thread)
-        thread_filter = _get_or_create_thread_filter(thread, lock=True)
+    thread = session.execute(
+        select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+    ).scalar_one()
+    _assert_thread_accepts_messages(thread)
+    thread_filter = _get_or_create_thread_filter(thread, lock=True)
 
-        _persist_thread_goal_state(thread, goal_state.model_dump())
-        assistant_message = _append_message(
-            thread,
-            role=ChatMessage.Role.ASSISTANT,
-            content=assistant_content,
-            metadata=assistant_metadata,
-        )
+    _persist_thread_goal_state(thread, goal_state.model_dump())
+    assistant_message = _append_message(
+        thread,
+        role="assistant",
+        content=assistant_content,
+        meta=assistant_metadata,
+    )
 
-        thread.last_message_preview = assistant_content[:500]
-        thread.last_activity_at = timezone.now()
-        thread.save(update_fields=["last_message_preview", "last_activity_at", "updated_at", "metadata"])
+    thread.last_message_preview = assistant_content[:500]
+    thread.last_activity_at = now
+    thread.updated_at = now
 
-        _update_dynamic_thread_title(thread)
+    _update_dynamic_thread_title(thread)
 
-        return {
+    return {
             "thread": _serialize_thread(thread),
             "assistant_message": _serialize_message(assistant_message),
             "active_filters": thread_filter.active_filters,
@@ -385,6 +382,7 @@ def _process_soft_redirect_turn(
     user_message: str,
     existing_goal_state: dict[str, Any],
 ) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
     has_pending_booking = bool((thread_filter.pending_booking or {}).get("listing_code"))
     current_filter_payload = _compact_filter_state(current_filters.model_dump())
     has_current_filters = bool(current_filter_payload)
@@ -432,25 +430,21 @@ def _process_soft_redirect_turn(
     )
     _persist_thread_goal_state(thread, goal_state.model_dump())
 
+    session = get_session()
+    thread_filter = session.execute(
+        select(ThreadFilter).where(ThreadFilter.id == thread_filter.id).with_for_update()
+    ).scalar_one()
     thread_filter.latest_result_context = latest_result_context
     thread_filter.resolver_trace = ["resolve_turn_policy"]
     thread_filter.version += 1
-    thread_filter.last_resolved_at = timezone.now()
-    thread_filter.save(
-        update_fields=[
-            "latest_result_context",
-            "resolver_trace",
-            "version",
-            "last_resolved_at",
-            "updated_at",
-        ]
-    )
+    thread_filter.last_resolved_at = now
+    thread_filter.updated_at = now
 
     assistant_message = _append_message(
         thread,
-        role=ChatMessage.Role.ASSISTANT,
+        role="assistant",
         content=assistant_content,
-        metadata={
+        meta={
             "needs_clarification": False,
             "clarification_question": None,
             "search_domains": search_domains,
@@ -469,10 +463,12 @@ def _process_soft_redirect_turn(
         },
     )
 
+    thread = session.execute(
+        select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+    ).scalar_one()
     thread.last_message_preview = assistant_content[:500]
-    thread.last_activity_at = timezone.now()
-    thread.save(update_fields=["last_message_preview", "last_activity_at", "updated_at", "metadata"])
-
+    thread.last_activity_at = now
+    thread.updated_at = now
     _update_dynamic_thread_title(thread)
 
     return {
@@ -521,11 +517,15 @@ def _reconcile_booking_resolution(
     if booking_resolution.action == "awaiting_user_info":
         pending_booking = dict(thread_filter.pending_booking or {})
         requested_field = booking_resolution.requested_field or pending_booking.get("awaiting_field", "")
-        if requested_field and pending_booking.get("awaiting_field") != requested_field:
+        if requested_field and requested_field in FIELD_PROMPTS:
             pending_booking["status"] = "awaiting_user_info"
             pending_booking["awaiting_field"] = requested_field
+            thread_filter = session.execute(
+                select(ThreadFilter).where(ThreadFilter.id == thread_filter.id).with_for_update()
+            ).scalar_one()
             thread_filter.pending_booking = pending_booking
-            thread_filter.save(update_fields=["pending_booking", "updated_at"])
+            thread_filter.updated_at = now
+            session.flush()
 
     if (
         booking_resolution.action == "selection_pending"
@@ -538,26 +538,18 @@ def _reconcile_booking_resolution(
             next_field = missing_fields[0]
             pending_booking["status"] = "awaiting_user_info"
             pending_booking["awaiting_field"] = next_field
+            thread_filter = session.execute(
+                select(ThreadFilter).where(ThreadFilter.id == thread_filter.id).with_for_update()
+            ).scalar_one()
             thread_filter.pending_booking = pending_booking
-            thread_filter.save(update_fields=["pending_booking", "updated_at"])
+            thread_filter.updated_at = now
+            session.flush()
             return type(booking_resolution)(
                 action="awaiting_user_info",
                 message=FIELD_PROMPTS[next_field],
-                listing_code=pending_booking.get("listing_code", ""),
                 requested_field=next_field,
-                selected_event=pending_booking.get("event_snapshot", {}),
-                booking={
-                    "thread_id": str(thread_filter.thread_id),
-                    "event_type": pending_booking.get("event_snapshot", {}).get("domain", ""),
-                    "status": pending_booking.get("status", ""),
-                    "event_title": pending_booking.get("event_snapshot", {}).get("title", ""),
-                    "customer_name": pending_booking.get("customer_info", {}).get("name", ""),
-                    "customer_email": pending_booking.get("customer_info", {}).get("email", ""),
-                    "customer_contact_number": pending_booking.get("customer_info", {}).get("contact_number", ""),
-                    "city": pending_booking.get("event_snapshot", {}).get("city", ""),
-                    "venue_name": pending_booking.get("event_snapshot", {}).get("venue_name", ""),
-                    "starts_at": pending_booking.get("event_snapshot", {}).get("start_at", ""),
-                },
+                pending_booking=pending_booking,
+                booking={},
                 candidates=[],
             )
 
@@ -601,26 +593,52 @@ def _results_by_domain_from_latest_context(latest_result_context: dict[str, Any]
     }
 
 def _get_or_create_thread(*, user_message: str, thread_id: str | None) -> tuple[ChatThread, bool]:
+    from uuid import UUID
+    session = get_session()
+    now = datetime.now(timezone.utc)
     if thread_id:
-        return ChatThread.objects.get(id=thread_id), False
+        thread_uuid = UUID(thread_id) if isinstance(thread_id, str) else thread_id
+        thread = session.execute(select(ChatThread).where(ChatThread.id == thread_uuid)).scalar_one_or_none()
+        if thread is None:
+            raise ChatTurnError("Thread not found", status_code=404)
+        return thread, False
 
     title = user_message.strip()[:80] or "New thread"
-    thread = ChatThread.objects.create(
+    thread = ChatThread(
         title=title,
-        mode=ChatThread.Mode.ENTERTAINMENT,
+        summary="",
+        mode="entertainment",
+        status="active",
         last_message_preview=user_message[:500],
-        last_activity_at=timezone.now(),
+        last_activity_at=now,
+        meta={},
+        created_at=now,
+        updated_at=now,
     )
+    session.add(thread)
+    session.flush()
+    thread_filter = ThreadFilter(
+        thread_id=thread.id,
+        active_filters={},
+        latest_result_context={},
+        pending_booking={},
+        resolver_trace=[],
+        version=1,
+        last_resolved_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(thread_filter)
     return thread, True
 
 
 def _assert_thread_accepts_messages(thread: ChatThread) -> None:
-    if thread.status == ChatThread.Status.BOOKED:
+    if thread.status == "booked":
         raise ChatTurnError(
             "This thread already has a confirmed booking. Start a new thread to plan another event.",
             status_code=409,
         )
-    if thread.status == ChatThread.Status.ARCHIVED:
+    if thread.status == "archived":
         raise ChatTurnError(
             "This thread is archived and cannot accept new messages.",
             status_code=409,
@@ -628,44 +646,71 @@ def _assert_thread_accepts_messages(thread: ChatThread) -> None:
 
 
 def _get_or_create_thread_filter(thread: ChatThread, *, lock: bool = False) -> ThreadFilter:
-    thread_filter, _created = ThreadFilter.objects.get_or_create(thread=thread)
+    session = get_session()
+    now = datetime.now(timezone.utc)
+ 
+    thread_filter = session.execute(select(ThreadFilter).where(ThreadFilter.thread_id == thread.id)).scalar_one_or_none()
+    if thread_filter is None:
+        thread_filter = ThreadFilter(
+            thread_id=thread.id,
+            active_filters={},
+            latest_result_context={},
+            pending_booking={},
+            resolver_trace=[],
+            version=1,
+            last_resolved_at=None,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(thread_filter)
+        session.flush()
+ 
     if lock:
-        thread_filter = ThreadFilter.objects.select_for_update().get(pk=thread_filter.pk)
+        thread_filter = session.execute(
+            select(ThreadFilter).where(ThreadFilter.id == thread_filter.id).with_for_update()
+        ).scalar_one()
     return thread_filter
 
 
 def _get_thread_goal_state(thread: ChatThread) -> dict[str, Any]:
-    metadata = thread.metadata or {}
-    goal_state = metadata.get("goal_state")
+    meta = thread.meta or {}
+    goal_state = meta.get("goal_state")
     return goal_state if isinstance(goal_state, dict) else {}
 
 
 def _persist_thread_goal_state(thread: ChatThread, goal_state: dict[str, Any]) -> None:
-    metadata = dict(thread.metadata or {})
-    metadata["goal_state"] = goal_state
-    thread.metadata = metadata
+    meta = dict(thread.meta or {})
+    meta["goal_state"] = goal_state
+    thread.meta = meta
 
 
 def _update_dynamic_thread_title(thread: ChatThread) -> None:
+    session = get_session()
     goal_summary = str(_get_thread_goal_state(thread).get("goal_summary", "")).strip()
     if goal_summary:
         next_title = goal_summary[:255]
         if next_title and thread.title != next_title:
-            thread.title = next_title
-            thread.save(update_fields=["title", "updated_at"])
-            thread.refresh_from_db(fields=["title", "updated_at"])
+            now = datetime.now(timezone.utc)
+            locked_thread = session.execute(
+                select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+            ).scalar_one()
+            locked_thread.title = next_title
+            locked_thread.updated_at = now
         return
 
-    thread_filter = ThreadFilter.objects.filter(thread=thread).first()
+    thread_filter = session.execute(select(ThreadFilter).where(ThreadFilter.thread_id == thread.id)).scalar_one_or_none()
     pending_booking = dict((thread_filter.pending_booking or {}) if thread_filter else {})
     pending_snapshot = dict((pending_booking.get("event_snapshot") or {}) if pending_booking else {})
     pending_title = str(pending_snapshot.get("title", "") or "").strip()
     if pending_title:
         next_title = f"Book {pending_title}"[:255]
         if next_title and thread.title != next_title:
-            thread.title = next_title
-            thread.save(update_fields=["title", "updated_at"])
-            thread.refresh_from_db(fields=["title", "updated_at"])
+            now = datetime.now(timezone.utc)
+            locked_thread = session.execute(
+                select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+            ).scalar_one()
+            locked_thread.title = next_title
+            locked_thread.updated_at = now
         return
 
     active_filters = dict((thread_filter.active_filters or {}) if thread_filter else {})
@@ -689,23 +734,30 @@ def _update_dynamic_thread_title(thread: ChatThread) -> None:
         if parts:
             next_title = " ".join(parts)[:255]
             if next_title and thread.title != next_title:
-                thread.title = next_title
-                thread.save(update_fields=["title", "updated_at"])
-                thread.refresh_from_db(fields=["title", "updated_at"])
+                now = datetime.now(timezone.utc)
+                locked_thread = session.execute(
+                    select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+                ).scalar_one()
+                locked_thread.title = next_title
+                locked_thread.updated_at = now
             return
 
-    from django.conf import settings
-
-    if not getattr(settings, "ENABLE_DYNAMIC_THREAD_TITLE_GENERATION", False):
+    if os.getenv("ENABLE_DYNAMIC_THREAD_TITLE_GENERATION", "false").lower() not in {"1", "true", "yes"}:
         return
 
     # Extract max 5 recent user messages to keep the LLM fast
-    recent_user_messages = list(
-        thread.messages.filter(role=ChatMessage.Role.USER)
-        .order_by("-position")[:5]
-        .values_list("content", flat=True)
+    recent_user_messages = (
+        session.execute(
+            select(ChatMessage.content)
+            .where(ChatMessage.thread_id == thread.id)
+            .where(ChatMessage.role == ChatMessage.Role.USER)
+            .order_by(ChatMessage.position.desc())
+            .limit(5)
+        )
+        .scalars()
+        .all()
     )
-    recent_user_messages.reverse()
+    recent_user_messages = list(reversed(list(recent_user_messages)))
     
     if not recent_user_messages:
         return
@@ -713,10 +765,12 @@ def _update_dynamic_thread_title(thread: ChatThread) -> None:
     try:
         new_title = generate_dynamic_thread_title(recent_user_messages)
         if new_title and new_title.lower() != "new thread":
-            thread.title = new_title
-            thread.save(update_fields=["title", "updated_at"])
-            # Refresh if necessary
-            thread.refresh_from_db(fields=["title", "updated_at"])
+            now = datetime.now(timezone.utc)
+            locked_thread = session.execute(
+                select(ChatThread).where(ChatThread.id == thread.id).with_for_update()
+            ).scalar_one()
+            locked_thread.title = new_title
+            locked_thread.updated_at = now
     except Exception:
         pass
 
@@ -726,16 +780,30 @@ def _append_message(
     *,
     role: str,
     content: str,
-    metadata: dict[str, Any],
+    meta: dict[str, Any],
 ) -> ChatMessage:
-    next_position = (thread.messages.aggregate(max_position=Max("position"))["max_position"] or 0) + 1
-    return ChatMessage.objects.create(
-        thread=thread,
+    session = get_session()
+    now = datetime.now(timezone.utc)
+    locked_thread = session.execute(select(ChatThread).where(ChatThread.id == thread.id).with_for_update()).scalar_one()
+    next_position = (
+        session.execute(
+            select(func.coalesce(func.max(ChatMessage.position), 0)).where(ChatMessage.thread_id == locked_thread.id)
+        ).scalar_one()
+        + 1
+    )
+    message = ChatMessage(
+        thread_id=locked_thread.id,
         position=next_position,
         role=role,
         content=content,
-        metadata=metadata,
+        tool_name="",
+        meta=meta,
+        created_at=now,
+        updated_at=now,
     )
+    session.add(message)
+    session.flush()
+    return message
 
 
 def _merge_filter_state(
@@ -935,6 +1003,6 @@ def _serialize_message(message: ChatMessage) -> dict[str, Any]:
         "position": message.position,
         "role": message.role,
         "content": message.content,
-        "metadata": message.metadata,
+        "metadata": message.meta,
         "created_at": message.created_at.isoformat(),
     }

@@ -28,7 +28,7 @@ from apps.bookings.services import (
     mark_thread_pending_booking,
     select_thread_pending_booking,
 )
-from apps.chats.models import ChatThread, ThreadFilter
+from flask_app.orm.models import ChatThread, ThreadFilter
 from apps.events.filter_tools import (
     get_all_event_types,
     get_available_movie_cast_members,
@@ -72,9 +72,12 @@ logger = logging.getLogger(__name__)
 
 
 def _slow_log_threshold_seconds() -> float:
-    from django.conf import settings
+    from flask import current_app
 
-    return float(getattr(settings, "AGENT_SLOW_LOG_SECONDS", 2.5))
+    settings = current_app.config.get("SETTINGS")
+    if settings:
+        return settings.agent_slow_log_seconds
+    return 2.5
 
 
 def _timed_invoke(label: str, callback):
@@ -107,13 +110,13 @@ class ResolutionIssue:
 
 
 def get_chat_model(*, resolver: bool = False):
-    from django.conf import settings
+    from flask import current_app
 
-    # Check if Ollama is enabled
-    use_ollama = getattr(settings, "USE_OLLAMA", False)
-    ollama_host = getattr(settings, "OLLAMA_HOST", "http://127.0.0.1:11434")
-    ollama_model = getattr(settings, "OLLAMA_MODEL", "gemma4:e2b")
-    ollama_timeout = float(getattr(settings, "OLLAMA_LLM_TIMEOUT_SECONDS", 20.0))
+    settings = current_app.config.get("SETTINGS")
+    use_ollama = settings.use_ollama if settings else False
+    ollama_host = settings.ollama_host if settings else "http://127.0.0.1:11434"
+    ollama_model = settings.ollama_model if settings else "gemma4:e2b"
+    ollama_timeout = settings.ollama_llm_timeout_seconds if settings else 20.0
 
     if use_ollama:
         return ChatOllama(
@@ -125,14 +128,15 @@ def get_chat_model(*, resolver: bool = False):
         )
 
     model_name = (
-        getattr(settings, "OPENAI_RESOLVER_MODEL", "gpt-4.1-mini")
+        settings.openai_resolver_model
         if resolver
-        else getattr(settings, "OPENAI_CHAT_MODEL", "gpt-4.1-mini")
-    )
+        else settings.openai_chat_model
+    ) if settings else "gpt-4.1-mini"
     return ChatOpenAI(
         model=model_name,
         temperature=0,
-        timeout=float(getattr(settings, "OPENAI_LLM_TIMEOUT_SECONDS", 20.0)),
+        timeout=settings.openai_llm_timeout_seconds if settings else 20.0,
+        api_key=settings.openai_api_key if settings else None,
     )
 
 
@@ -507,8 +511,18 @@ def _build_sport_catalog_agent():
 
 
 def _get_booking_thread_state(thread_id: str) -> tuple[ChatThread, ThreadFilter]:
-    thread = ChatThread.objects.get(id=thread_id)
-    thread_filter = ThreadFilter.objects.get(thread=thread)
+    from uuid import UUID
+    from flask_app.db import get_session
+    from sqlalchemy import select
+
+    session = get_session()
+    thread_uuid = UUID(thread_id) if isinstance(thread_id, str) else thread_id
+    thread = session.execute(
+        select(ChatThread).where(ChatThread.id == thread_uuid)
+    ).scalar_one()
+    thread_filter = session.execute(
+        select(ThreadFilter).where(ThreadFilter.thread_id == thread_uuid)
+    ).scalar_one()
     return thread, thread_filter
 
 

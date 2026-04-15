@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from secrets import token_hex
 from typing import Any
 
-from django.utils import timezone
+from sqlalchemy import func, select
 
 from apps.agents.services import ChatTurnError
-from apps.chats.models import ChatMessage, ChatThread, ThreadFilter
-from apps.flights.models import FlightBooking, FlightOffer
+from flask_app.db import get_session
+from flask_app.orm.models import ChatMessage, ChatThread, ThreadFilter, FlightBooking, FlightOffer
 
 REQUIRED_FLIGHT_BOOKING_USER_FIELDS = ("name", "email", "contact_number")
 FLIGHT_FIELD_PROMPTS = {
@@ -46,7 +47,7 @@ def select_thread_pending_flight_booking(*, thread_filter: ThreadFilter, listing
         "status": "pending_confirmation",
         "listing_code": listing_code,
         "event_snapshot": selected,
-        "selected_at": timezone.now().isoformat(),
+        "selected_at": datetime.now(timezone.utc).isoformat(),
         "awaiting_field": None,
         "customer_info": {
             "name": existing_customer_info.get("name", ""),
@@ -55,13 +56,17 @@ def select_thread_pending_flight_booking(*, thread_filter: ThreadFilter, listing
         },
     }
     thread_filter.pending_booking = pending_booking
-    thread_filter.save(update_fields=["pending_booking", "updated_at"])
+    thread_filter.updated_at = datetime.now(timezone.utc)
+    session = get_session()
+    session.flush()
     return pending_booking
 
 
 def clear_thread_pending_flight_booking(*, thread_filter: ThreadFilter) -> dict[str, Any]:
     thread_filter.pending_booking = {}
-    thread_filter.save(update_fields=["pending_booking", "updated_at"])
+    thread_filter.updated_at = datetime.now(timezone.utc)
+    session = get_session()
+    session.flush()
     return {}
 
 
@@ -91,7 +96,9 @@ def save_thread_flight_booking_user_info(*, thread_filter: ThreadFilter, field_n
         "awaiting_field": None,
     }
     thread_filter.pending_booking = updated_pending_booking
-    thread_filter.save(update_fields=["pending_booking", "updated_at"])
+    thread_filter.updated_at = datetime.now(timezone.utc)
+    session = get_session()
+    session.flush()
     return updated_pending_booking
 
 
@@ -138,7 +145,9 @@ def attempt_thread_pending_flight_booking_confirmation(
             "awaiting_field": next_field,
         }
         thread_filter.pending_booking = updated_pending_booking
-        thread_filter.save(update_fields=["pending_booking", "updated_at"])
+        thread_filter.updated_at = datetime.now(timezone.utc)
+        session = get_session()
+        session.flush()
         return {
             "status": "missing_user_info",
             "next_required_field": next_field,
@@ -164,33 +173,42 @@ def create_flight_booking_from_pending(
     thread_filter: ThreadFilter,
     confirmed_via: str,
 ) -> tuple[FlightBooking, bool]:
+    session = get_session()
+    now = datetime.now(timezone.utc)
     pending_booking = get_pending_flight_booking(thread_filter=thread_filter)
     listing_code = pending_booking.get("listing_code")
     if not listing_code:
         raise ChatTurnError("No flight is currently selected for booking.", status_code=409)
 
-    existing = thread.flight_bookings.filter(listing_code=listing_code).order_by("-confirmed_at").first()
+    existing = session.execute(
+        select(FlightBooking).where(
+            FlightBooking.thread_id == thread.id,
+            FlightBooking.listing_code == listing_code,
+        ).order_by(FlightBooking.confirmed_at.desc())
+    ).scalar_one_or_none()
     if existing is not None:
         return existing, True
 
-    if thread.status == ChatThread.Status.BOOKED:
+    if thread.status == "booked":
         raise ChatTurnError(
             "This thread already has a confirmed booking. Start a new thread to book another flight.",
             status_code=409,
         )
 
     offer_snapshot = pending_booking.get("event_snapshot", {}) or {}
-    offer = FlightOffer.objects.filter(listing_code=listing_code).first()
+    offer = session.execute(
+        select(FlightOffer).where(FlightOffer.listing_code == listing_code)
+    ).scalar_one_or_none()
     if offer is None:
         raise ChatTurnError("Selected flight could not be found.", status_code=404)
 
     customer_info = pending_booking.get("customer_info", {}) or {}
-    booking = FlightBooking.objects.create(
-        thread=thread,
+    booking = FlightBooking(
+        thread_id=thread.id,
         booking_reference=generate_flight_booking_reference(),
-        status=FlightBooking.Status.CONFIRMED,
+        status="confirmed",
         listing_code=listing_code,
-        offer=offer,
+        offer_id=offer.id,
         route=f"{offer.origin_city} to {offer.destination_city}",
         origin_city=offer.origin_city,
         origin_iata=offer.origin_iata,
@@ -210,15 +228,20 @@ def create_flight_booking_from_pending(
         passenger_contact_number=customer_info.get("contact_number", ""),
         filter_snapshot=thread_filter.active_filters or {},
         offer_snapshot=offer_snapshot,
-        metadata={"confirmed_via": confirmed_via},
+        meta={"confirmed_via": confirmed_via},
+        confirmed_at=now,
+        created_at=now,
+        updated_at=now,
     )
+    session.add(booking)
 
-    thread.status = ChatThread.Status.BOOKED
-    thread.last_activity_at = timezone.now()
-    thread.save(update_fields=["status", "last_activity_at", "updated_at"])
+    thread.status = "booked"
+    thread.last_activity_at = now
+    thread.updated_at = now
 
     thread_filter.pending_booking = {}
-    thread_filter.save(update_fields=["pending_booking", "updated_at"])
+    thread_filter.updated_at = now
+    session.flush()
     return booking, False
 
 
@@ -228,27 +251,36 @@ def append_flight_booking_confirmation_message(
     booking: FlightBooking,
     listing_code: str,
 ) -> ChatMessage:
+    session = get_session()
+    now = datetime.now(timezone.utc)
     confirmation_message = (
         f"Flight booking confirmed for {booking.route} on {booking.departure_date.isoformat()} "
         f"with {booking.airline_name} {booking.flight_number}. Your reference is {booking.booking_reference}."
     )
-    next_position = (thread.messages.order_by("-position").values_list("position", flat=True).first() or 0) + 1
-    message = ChatMessage.objects.create(
-        thread=thread,
+    max_position = session.execute(
+        select(func.coalesce(func.max(ChatMessage.position), 0)).where(ChatMessage.thread_id == thread.id)
+    ).scalar()
+    next_position = max_position + 1
+    message = ChatMessage(
+        thread_id=thread.id,
         position=next_position,
-        role=ChatMessage.Role.ASSISTANT,
+        role="assistant",
         content=confirmation_message,
-        metadata={
+        meta={
             "booking_reference": booking.booking_reference,
             "listing_code": listing_code,
             "booking_type": "flight",
             "booking_action": "booking_confirmed",
             "booking": serialize_flight_booking(booking),
         },
+        created_at=now,
+        updated_at=now,
     )
+    session.add(message)
     thread.last_message_preview = confirmation_message[:500]
-    thread.last_activity_at = timezone.now()
-    thread.save(update_fields=["last_message_preview", "last_activity_at", "updated_at"])
+    thread.last_activity_at = now
+    thread.updated_at = now
+    session.flush()
     return message
 
 
@@ -271,7 +303,7 @@ def serialize_flight_booking(booking: FlightBooking) -> dict[str, Any]:
 
 
 def generate_flight_booking_reference() -> str:
-    return f"FLT-{timezone.now().strftime('%Y%m%d')}-{token_hex(3).upper()}"
+    return f"FLT-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{token_hex(3).upper()}"
 
 
 def _normalize_user_value(*, field_name: str, value: str) -> str:

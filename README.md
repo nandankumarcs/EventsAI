@@ -13,8 +13,9 @@ The current MVP supports:
 ## Stack
 
 - frontend: React, TypeScript, Vite, Tailwind, shadcn components
-- backend: Django, PostgreSQL, LangChain, OpenAI API
+- backend: Flask, SQLAlchemy, Alembic, PostgreSQL, LangChain, OpenAI API
 - data: seeded `movie_events` and `sport_events` tables with future-only records
+- process manager: PM2 (production)
 
 ## Repository Layout
 
@@ -26,18 +27,19 @@ The current MVP supports:
 │   │   ├── bookings
 │   │   ├── chats
 │   │   ├── core
-│   │   └── events
-│   ├── config
-│   ├── manage.py
+│   │   ├── events
+│   │   └── flights
+│   ├── flask_app                  # Flask app factory, blueprints, ORM models
+│   ├── flask_wsgi.py              # WSGI entry point
+│   ├── start.py                   # Startup script (reads PORT from env)
 │   └── requirements.txt
 ├── frontend
 │   ├── src
 │   │   ├── components
 │   │   └── lib
 │   └── package.json
-├── start.sh                       # unified build + run script
-├── Makefile                       # convenience wrapper for start.sh
-└── PHASEWISE_IMPLEMENTATION_PLAN.md
+├── ecosystem.config.cjs           # PM2 process manager config
+└── README.md
 ```
 
 ## Environment Setup
@@ -47,14 +49,13 @@ The current MVP supports:
 Copy `backend/.env.example` to `backend/.env` and configure:
 
 ```bash
-DJANGO_SECRET_KEY=replace-me
-DJANGO_DEBUG=true
-DJANGO_ALLOWED_HOSTS=127.0.0.1,localhost
-DJANGO_CORS_ALLOWED_ORIGINS=http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5174,http://localhost:5174
+SECRET_KEY=replace-me
+DEBUG=true
 DATABASE_URL=postgres://username:password@host:port/database?sslmode=require
 OPENAI_API_KEY=replace-me
 OPENAI_CHAT_MODEL=gpt-4.1-mini
 OPENAI_RESOLVER_MODEL=gpt-4.1-mini
+PORT=8000
 ```
 
 ### Frontend
@@ -67,22 +68,20 @@ VITE_API_BASE_URL=http://127.0.0.1:8000
 
 ## Local Run
 
-### One-time setup
+### One-time setup (fresh clone)
 
 ```bash
-# Backend — create venv and install Python deps
-cd backend
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python manage.py migrate
-cd ..
+# 1. Create virtualenv and install dependencies
+python3 -m venv backend/.venv
+backend/.venv/bin/pip install -r backend/requirements.txt
 
-# Frontend — install Node deps
-cd frontend && npm install && cd ..
+# 2. Copy environment file and configure
+cp backend/.env.example backend/.env
+# Edit backend/.env with your DATABASE_URL, OPENAI_API_KEY, etc.
+
+# 3. Install frontend dependencies and build
+cd frontend && npm install && npm run build && cd ..
 ```
-
-You can skip the manual steps above if you use `./start.sh` — it will bootstrap missing dependencies automatically.
 
 ### Seed data
 
@@ -90,47 +89,34 @@ The seed command resets and repopulates movie and sport catalog data with future
 
 ```bash
 cd backend
-.venv/bin/python manage.py seed_event_data --reset
+.venv/bin/python -m scripts.seed_event_data --reset
 ```
 
-### Start (unified command)
-
-From the **project root**, run either of the following — they are equivalent:
+### Start with PM2 (production)
 
 ```bash
-./start.sh
-# or
-make start
+pm2 start ecosystem.config.cjs
 ```
 
-This will:
-1. Install frontend dependencies if `frontend/node_modules` is missing (`npm ci`)
-2. Build the React frontend (`npm run build` → `frontend/dist/`)
-3. Create the backend virtualenv and install Python dependencies if `backend/.venv` is missing
-4. Start the Django server at **http://127.0.0.1:8000**
+The app will:
+- Read `PORT` from `backend/.env` (default: 8000)
+- Serve API at `/api/*` and React SPA at root
+- Run at **http://127.0.0.1:8000** (or whatever PORT is set)
 
-The server now serves both the API (`/api/*`) and the compiled React SPA from a single origin. No separate frontend dev server is needed.
-
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
-
-### Start in dev mode (Vite + Django)
-
-If you want frontend HMR during development, start the Vite dev server alongside Django:
+### Start manually (development)
 
 ```bash
-./start.sh --dev
+cd backend
+.venv/bin/python start.py
 ```
 
-This will start:
-1. Vite dev server at **http://127.0.0.1:5173**
-2. Django API server at **http://127.0.0.1:8000**
-
-### Running backend only (no frontend rebuild)
+### PM2 commands
 
 ```bash
-make runserver
-# or
-cd backend && .venv/bin/python manage.py runserver
+pm2 status              # Check app status
+pm2 logs attend-api     # View logs
+pm2 stop attend-api     # Stop app
+pm2 restart attend-api  # Restart app
 ```
 
 ## Core API Endpoints
@@ -159,8 +145,11 @@ cd backend && .venv/bin/python manage.py runserver
 
 ```bash
 cd backend
-.venv/bin/python manage.py check
-.venv/bin/python manage.py test apps.chats apps.bookings apps.agents apps.events --keepdb
+# Run health check
+curl http://127.0.0.1:8000/api/health/
+
+# Run chat edge case verification
+python3 verify_chat_edge_cases.py
 ```
 
 ### Frontend

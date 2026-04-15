@@ -6,9 +6,11 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from django.db.models import Q, QuerySet
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.orm import Session
 
-from apps.flights.models import FlightOffer
+from flask_app.db import get_session
+from flask_app.orm.models import FlightOffer
 
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 100
@@ -53,43 +55,58 @@ def search_flight_offers(
     offset: int = 0,
 ) -> FlightSearchResult:
     filters = filters or {}
-    queryset = FlightOffer.objects.filter(is_published=True).order_by(
-        "departure_date",
-        "departure_at",
-        "origin_city",
-        "destination_city",
+    session = get_session()
+    stmt = (
+        select(FlightOffer)
+        .where(FlightOffer.is_published.is_(True))
+        .order_by(
+            FlightOffer.departure_date,
+            FlightOffer.departure_at,
+            FlightOffer.origin_city,
+            FlightOffer.destination_city,
+        )
     )
-    queryset = _apply_flight_filters(queryset, filters)
-    return _build_result(queryset, filters, limit, offset)
+    stmt = _apply_flight_filters(stmt, filters)
+    return _build_result(session, stmt, filters, limit, offset)
 
 
 def get_available_origin_cities() -> list[str]:
-    return _distinct_values(FlightOffer.objects.filter(is_published=True), "origin_city")
+    session = get_session()
+    return _distinct_values(session, "origin_city")
 
 
 def get_available_destination_cities() -> list[str]:
-    return _distinct_values(FlightOffer.objects.filter(is_published=True), "destination_city")
+    session = get_session()
+    return _distinct_values(session, "destination_city")
 
 
 def get_available_airlines() -> list[str]:
-    return _distinct_values(FlightOffer.objects.filter(is_published=True), "airline_name")
+    session = get_session()
+    return _distinct_values(session, "airline_name")
 
 
 def get_available_cabin_classes() -> list[str]:
-    return _distinct_values(FlightOffer.objects.filter(is_published=True), "cabin_class")
+    session = get_session()
+    return _distinct_values(session, "cabin_class")
 
 
 def _build_result(
-    queryset: QuerySet[FlightOffer],
+    session: Session,
+    stmt,
     filters: dict[str, Any],
     limit: int,
     offset: int,
 ) -> FlightSearchResult:
     normalized_limit = max(1, min(limit, MAX_LIMIT))
     normalized_offset = max(0, offset)
-    page = list(queryset[normalized_offset : normalized_offset + normalized_limit])
+    count = session.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
+    page = (
+        session.execute(stmt.offset(normalized_offset).limit(normalized_limit))
+        .scalars()
+        .all()
+    )
     return FlightSearchResult(
-        count=queryset.count(),
+        count=int(count),
         limit=normalized_limit,
         offset=normalized_offset,
         filters=filters,
@@ -97,80 +114,84 @@ def _build_result(
     )
 
 
-def _apply_flight_filters(queryset: QuerySet[FlightOffer], filters: dict[str, Any]) -> QuerySet[FlightOffer]:
-    queryset = _filter_in(queryset, "listing_code", filters.get("listing_codes"))
-    queryset = _filter_in(queryset, "origin_city", filters.get("origin_cities"))
-    queryset = _filter_in(queryset, "destination_city", filters.get("destination_cities"))
-    queryset = _filter_in(queryset, "origin_iata", filters.get("origin_iatas"))
-    queryset = _filter_in(queryset, "destination_iata", filters.get("destination_iatas"))
-    queryset = _filter_in(queryset, "airline_name", filters.get("airlines"))
-    queryset = _filter_in(queryset, "cabin_class", filters.get("cabin_classes"))
-    queryset = _filter_in(queryset, "stops", filters.get("stops"))
-    queryset = _filter_date_in(queryset, "departure_date", filters.get("departure_dates"))
-    queryset = _filter_date_range(queryset, "departure_date", filters.get("departure_date_from"), filters.get("departure_date_to"))
-    queryset = _filter_numeric_range(queryset, "total_amount", filters.get("price_min"), filters.get("price_max"))
+def _apply_flight_filters(stmt, filters: dict[str, Any]):
+    stmt = _filter_in(stmt, FlightOffer.listing_code, filters.get("listing_codes"))
+    stmt = _filter_in(stmt, FlightOffer.origin_city, filters.get("origin_cities"))
+    stmt = _filter_in(stmt, FlightOffer.destination_city, filters.get("destination_cities"))
+    stmt = _filter_in(stmt, FlightOffer.origin_iata, filters.get("origin_iatas"))
+    stmt = _filter_in(stmt, FlightOffer.destination_iata, filters.get("destination_iatas"))
+    stmt = _filter_in(stmt, FlightOffer.airline_name, filters.get("airlines"))
+    stmt = _filter_in(stmt, FlightOffer.cabin_class, filters.get("cabin_classes"))
+    stmt = _filter_in(stmt, FlightOffer.stops, filters.get("stops"))
+    stmt = _filter_date_in(stmt, FlightOffer.departure_date, filters.get("departure_dates"))
+    stmt = _filter_date_range(stmt, FlightOffer.departure_date, filters.get("departure_date_from"), filters.get("departure_date_to"))
+    stmt = _filter_numeric_range(stmt, FlightOffer.total_amount, filters.get("price_min"), filters.get("price_max"))
 
     if filters.get("refundable_only"):
-        queryset = queryset.filter(refundable=True)
+        stmt = stmt.where(FlightOffer.refundable.is_(True))
 
     search_text = filters.get("search_text")
     if search_text:
-        for token in [part.strip() for part in str(search_text).split() if part.strip()]:
-            queryset = queryset.filter(
-                Q(origin_city__icontains=token)
-                | Q(destination_city__icontains=token)
-                | Q(origin_airport_name__icontains=token)
-                | Q(destination_airport_name__icontains=token)
-                | Q(airline_name__icontains=token)
-                | Q(flight_number__icontains=token)
+        tokens = [part.strip() for part in str(search_text).split() if part.strip()]
+        for token in tokens:
+            pattern = f"%{token}%"
+            stmt = stmt.where(
+                or_(
+                    FlightOffer.origin_city.ilike(pattern),
+                    FlightOffer.destination_city.ilike(pattern),
+                    FlightOffer.origin_airport_name.ilike(pattern),
+                    FlightOffer.destination_airport_name.ilike(pattern),
+                    FlightOffer.airline_name.ilike(pattern),
+                    FlightOffer.flight_number.ilike(pattern),
+                )
             )
 
-    return queryset
+    return stmt
 
 
-def _filter_in(queryset: QuerySet[FlightOffer], field_name: str, values: Any) -> QuerySet[FlightOffer]:
+def _filter_in(stmt, column, values: Any):
     normalized_values = _normalize_list(values)
     if not normalized_values:
-        return queryset
-    return queryset.filter(**{f"{field_name}__in": normalized_values})
+        return stmt
+    return stmt.where(column.in_(normalized_values))
 
 
-def _filter_date_in(queryset: QuerySet[FlightOffer], field_name: str, values: Any) -> QuerySet[FlightOffer]:
+def _filter_date_in(stmt, column, values: Any):
     normalized_values = [_parse_date(value) for value in _normalize_list(values)]
     normalized_values = [value for value in normalized_values if value]
     if not normalized_values:
-        return queryset
-    return queryset.filter(**{f"{field_name}__in": normalized_values})
+        return stmt
+    return stmt.where(column.in_(normalized_values))
 
 
 def _filter_date_range(
-    queryset: QuerySet[FlightOffer],
-    field_name: str,
+    stmt,
+    column,
     start_value: Any,
     end_value: Any,
-) -> QuerySet[FlightOffer]:
+):
     start_date = _parse_date(start_value)
     end_date = _parse_date(end_value)
     if start_date:
-        queryset = queryset.filter(**{f"{field_name}__gte": start_date})
+        stmt = stmt.where(column >= start_date)
     if end_date:
-        queryset = queryset.filter(**{f"{field_name}__lte": end_date})
-    return queryset
+        stmt = stmt.where(column <= end_date)
+    return stmt
 
 
 def _filter_numeric_range(
-    queryset: QuerySet[FlightOffer],
-    field_name: str,
+    stmt,
+    column,
     minimum: Any,
     maximum: Any,
-) -> QuerySet[FlightOffer]:
+):
     normalized_min = _parse_decimal(minimum)
     normalized_max = _parse_decimal(maximum)
     if normalized_min is not None:
-        queryset = queryset.filter(**{f"{field_name}__gte": normalized_min})
+        stmt = stmt.where(column >= normalized_min)
     if normalized_max is not None:
-        queryset = queryset.filter(**{f"{field_name}__lte": normalized_max})
-    return queryset
+        stmt = stmt.where(column <= normalized_max)
+    return stmt
 
 
 def _serialize_flight_offer(item: FlightOffer) -> dict[str, Any]:
@@ -211,12 +232,17 @@ def _serialize_flight_offer(item: FlightOffer) -> dict[str, Any]:
     }
 
 
-def _distinct_values(queryset: QuerySet[FlightOffer], field_name: str) -> list[str]:
-    return sorted(
-        value
-        for value in queryset.order_by().values_list(field_name, flat=True).distinct()
-        if value not in {None, ""}
+def _distinct_values(session: Session, field_name: str) -> list[str]:
+    column = getattr(FlightOffer, field_name)
+    stmt = (
+        select(column)
+        .where(FlightOffer.is_published.is_(True))
+        .where(column.is_not(None))
+        .distinct()
+        .order_by(column)
     )
+    values = session.execute(stmt).scalars().all()
+    return sorted([value for value in values if value not in {None, ""}])
 
 
 def _normalize_list(value: Any) -> list[Any]:
