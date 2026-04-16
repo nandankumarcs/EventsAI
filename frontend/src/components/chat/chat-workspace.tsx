@@ -59,6 +59,7 @@ export function ChatWorkspace({
   const pendingBooking = isPendingBooking(thread?.pending_booking) ? thread.pending_booking : null
   const awaitingFieldLabel = formatAwaitingFieldLabel(pendingBooking?.awaiting_field)
   const historyRef = useRef<HTMLDivElement | null>(null)
+  const inputRef = useRef<HTMLInputElement | null>(null)
   const [isAtBottom, setIsAtBottom] = useState(true)
 
 
@@ -90,6 +91,13 @@ export function ChatWorkspace({
     scrollToBottom('instant')
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [thread?.id, loadingThread])
+
+  // Focus the input field after a response is received
+  useEffect(() => {
+    if (!sending && !loadingThread && !isCreatingThread) {
+      inputRef.current?.focus()
+    }
+  }, [sending, loadingThread, isCreatingThread])
 
   return (
     <main className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background">
@@ -328,6 +336,7 @@ export function ChatWorkspace({
               }}
             >
               <Input
+                ref={inputRef}
                 id="message-draft"
                 name="message"
                 value={draft}
