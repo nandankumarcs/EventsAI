@@ -824,7 +824,10 @@ def _build_grounded_reply(
     total_results = sum(domain["count"] for domain in results_by_domain.values())
     if total_results == 0:
         descriptor = _build_filter_descriptor(filters, search_domains)
-        question = "Would you like to try a different date, time, or location?"
+        question = (
+            "You can refine by date, city, sport, or genre next (for example, "
+            "'show basketball in another city this weekend' or 'show action movies tonight')."
+        )
         return (
             f"I found no {descriptor} matching your current filters. {question}",
             True,
@@ -842,8 +845,9 @@ def _build_grounded_reply(
 
     if labels:
         descriptor = _build_filter_descriptor(filters, search_domains)
+        next_action_hint = "Next, you can ask me to book by position (for example, 'book the 2nd one'), book by event title, or refine filters by city/date/sport/genre."
         return (
-            f"I found {descriptor}, including {'. '.join(labels)}. Would you like to explore one of these or narrow the search further?",
+            f"I found {descriptor}, including {'. '.join(labels)}. {next_action_hint}",
             False,
             None,
         )
