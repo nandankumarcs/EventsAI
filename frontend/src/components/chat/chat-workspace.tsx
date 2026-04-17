@@ -343,6 +343,7 @@ export function ChatWorkspace({
                 onChange={(event) => onDraftChange(event.target.value)}
                 placeholder="Message EventsAI..."
                 disabled={sending}
+                autoComplete="off"
                 className="flex-1 border-0 bg-transparent px-3 py-2 text-[15px] shadow-none focus-visible:ring-0 placeholder:text-muted-foreground/70"
               />
               <Button 
