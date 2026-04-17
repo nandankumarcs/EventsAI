@@ -536,8 +536,8 @@ function ResultCard({ result, booked }: ResultCardProps) {
 
         {(result.min_price ?? result.max_price) ? (
           <p className="text-sm font-medium text-foreground">
-            Rs. {result.min_price ?? 0}
-            {result.max_price ? ` - ${result.max_price}` : ''}
+            ${result.min_price ?? 0}
+            {result.max_price ? ` - $${result.max_price}` : ''}
           </p>
         ) : null}
 
